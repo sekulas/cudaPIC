@@ -485,8 +485,8 @@ fn check_collisions_i(Particle:&mut Vec<ParticleType>, total_cs_i:&Vec<f64>, cs:
         let vya = rng.sample(&normal_range);
         let vza = rng.sample(&normal_range);
         let gx = Particle[k].vx - vxa;
-        let gy = Particle[k].vy - vxa;
-        let gz = Particle[k].vz - vxa;
+        let gy = Particle[k].vy - vya;
+        let gz = Particle[k].vz - vza;
         let g2 = gx.powf(2.0) + gy.powf(2.0) + gz.powf(2.0);
         let g: f64 = g2.sqrt();
         let energy: f64 = 0.5 * MU_ARAR * g2 / EV_TO_J;
