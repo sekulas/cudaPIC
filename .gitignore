@@ -1,0 +1,9 @@
+target/
+
+.edupic_checkpoint
+analysis*/
+*.dat
+*.log
+*.txt
+*.bin
+*.py
