@@ -37,6 +37,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::env;
 use std::time::Instant;
+use rayon::prelude::*;
 
 // constants
 
@@ -231,8 +232,8 @@ fn main(){
             check_boundaries(&mut Electrons, &mut N_e_abs_pow, &mut N_e_abs_gnd, measurement, & mut efed_pow, &mut efed_gnd, E_MASS);
             if t % N_SUB == 0 { check_boundaries(&mut Ions, &mut N_i_abs_pow, &mut N_i_abs_gnd, measurement, & mut ifed_pow, &mut ifed_gnd, AR_MASS); }
 
-            check_collisions_e(&mut Electrons, &mut Ions, &sigma_tot_e, &sigma, &mut N_e_coll, &mut rng);
-            if t % N_SUB == 0 { check_collisions_i(&mut Ions, &sigma_tot_i, &sigma, &mut N_i_coll, &mut rng); }
+            check_collisions_e(&mut Electrons, &mut Ions, &sigma_tot_e, &sigma, &mut N_e_coll);
+            if t % N_SUB == 0 { check_collisions_i(&mut Ions, &sigma_tot_i, &sigma, &mut N_i_coll); }
         }
 
         cycles_done = 1;
@@ -264,8 +265,8 @@ fn main(){
                 check_boundaries(&mut Electrons, &mut N_e_abs_pow, &mut N_e_abs_gnd, measurement, & mut efed_pow, &mut efed_gnd, E_MASS);
                 if t % N_SUB == 0 { check_boundaries(&mut Ions, &mut N_i_abs_pow, &mut N_i_abs_gnd, measurement, & mut ifed_pow, &mut ifed_gnd, AR_MASS); }
     
-                check_collisions_e(&mut Electrons, &mut Ions, &sigma_tot_e, &sigma, &mut N_e_coll, &mut rng);
-                if t % N_SUB == 0 { check_collisions_i(&mut Ions, &sigma_tot_i, &sigma, &mut N_i_coll, &mut rng); }
+                check_collisions_e(&mut Electrons, &mut Ions, &sigma_tot_e, &sigma, &mut N_e_coll);
+                if t % N_SUB == 0 { check_collisions_i(&mut Ions, &sigma_tot_i, &sigma, &mut N_i_coll); }
  
                 if measurement {
                     let t_index: usize = (t / N_BIN) as usize;
@@ -397,16 +398,13 @@ fn main(){
 fn move_particles(efield:&Vec<f64>, Particle:&mut Vec<ParticleType>, mass:f64, dt:f64, charge:f64)
 {
     let factor:f64 = dt / mass * charge;
-    let mut p:usize;
-    let mut e_x:f64;
-    let mut c2:f64;
-    for part in Particle.iter_mut() {
-        p   = (part.x * INV_DX).trunc() as usize;
-        c2  = part.x * INV_DX - (p as f64);
-        e_x = (1.0-c2) * efield[p] + c2 * efield[p+1];
+    Particle.par_iter_mut().for_each(|part| {
+        let p   = (part.x * INV_DX).trunc() as usize;
+        let c2  = part.x * INV_DX - (p as f64);
+        let e_x = (1.0 - c2) * efield[p] + c2 * efield[p+1];
         part.vx += e_x * factor;
         part.x  += part.vx * dt;
-    }
+    });
 }
 
 
@@ -414,8 +412,9 @@ fn move_particles(efield:&Vec<f64>, Particle:&mut Vec<ParticleType>, mass:f64, d
 // Ar+ / Ar collision                                                   //
 //----------------------------------------------------------------------//
 
-fn collision_ion(cs:&Vec<Vec<f64>>, Particle:&mut Vec<ParticleType>, 
-    vxa:f64, vya:f64, vza:f64, particle_index:usize, eindex: usize, rng: &mut ThreadRng) 
+// Refactored: operates directly on a single &mut ParticleType — safe to call from parallel context.
+fn collision_ion_par(cs:&Vec<Vec<f64>>, particle:&mut ParticleType,
+    vxa:f64, vya:f64, vza:f64, eindex: usize, rng: &mut ThreadRng)
 {
     let t0 = cs[I_ISO][eindex];
     let t1 = t0 + cs[I_BACK][eindex];
@@ -425,13 +424,13 @@ fn collision_ion(cs:&Vec<Vec<f64>>, Particle:&mut Vec<ParticleType>,
     let chi: f64;
     let eta: f64;
 
-    let mut gx = Particle[particle_index].vx - vxa; // relative velocity in cold gas approximation
-    let mut gy = Particle[particle_index].vy - vya;
-    let mut gz = Particle[particle_index].vz - vza;
+    let mut gx = particle.vx - vxa;
+    let mut gy = particle.vy - vya;
+    let mut gz = particle.vz - vza;
     let g = ( gx.powf(2.0) + gy.powf(2.0) + gz.powf(2.0) ).sqrt();
-    let wx = 0.5 * (Particle[particle_index].vx + vxa);
-    let wy = 0.5 * (Particle[particle_index].vy + vya);
-    let wz = 0.5 * (Particle[particle_index].vz + vza);
+    let wx = 0.5 * (particle.vx + vxa);
+    let wy = 0.5 * (particle.vy + vya);
+    let wz = 0.5 * (particle.vz + vza);
 
     // find Euler angles:
     if gx == 0.0 {
@@ -469,36 +468,47 @@ fn collision_ion(cs:&Vec<Vec<f64>>, Particle:&mut Vec<ParticleType>,
     gz = g * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
 
     // post-collision velocity of the electron
-
-    Particle[particle_index].vx = wx + 0.5 * gx;
-    Particle[particle_index].vy = wy + 0.5 * gy;
-    Particle[particle_index].vz = wz + 0.5 * gz;
+    particle.vx = wx + 0.5 * gx;
+    particle.vy = wy + 0.5 * gy;
+    particle.vz = wz + 0.5 * gz;
 }
 
+// Parallelized: each ion's collision check is independent.
+// Per-thread RNG is created via map_init to avoid sharing a single ThreadRng.
 fn check_collisions_i(Particle:&mut Vec<ParticleType>, total_cs_i:&Vec<f64>, cs:&Vec<Vec<f64>>,
-    N_coll: &mut u64, rng: &mut ThreadRng) 
+    N_coll: &mut u64)
 {
-    let normal_range = Normal::new(0.0, (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt()).unwrap();
+    let n: u64 = Particle
+        .par_iter_mut()
+        .map_init(
+            || {
+                let normal_range = Normal::new(0.0, (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt()).unwrap();
+                (rand::thread_rng(), normal_range)
+            },
+            |(rng, normal_range), part| {
+                let vxa = rng.sample(&*normal_range);
+                let vya = rng.sample(&*normal_range);
+                let vza = rng.sample(&*normal_range);
+                let gx = part.vx - vxa;
+                let gy = part.vy - vya;
+                let gz = part.vz - vza;
+                let g2 = gx.powf(2.0) + gy.powf(2.0) + gz.powf(2.0);
+                let g: f64 = g2.sqrt();
+                let energy: f64 = 0.5 * MU_ARAR * g2 / EV_TO_J;
+                let energy_index = core::cmp::min((energy / DE_CS + 0.5).trunc() as usize, CS_RANGES - 1);
 
-    for k in 0..Particle.len() {
-        let vxa = rng.sample(&normal_range);
-        let vya = rng.sample(&normal_range);
-        let vza = rng.sample(&normal_range);
-        let gx = Particle[k].vx - vxa;
-        let gy = Particle[k].vy - vxa;
-        let gz = Particle[k].vz - vxa;
-        let g2 = gx.powf(2.0) + gy.powf(2.0) + gz.powf(2.0);
-        let g: f64 = g2.sqrt();
-        let energy: f64 = 0.5 * MU_ARAR * g2 / EV_TO_J;
-        let energy_index = core::cmp::min((energy / (DE_CS as f64) + 0.5).trunc() as usize, (CS_RANGES-1) as usize);
-
-        let nu: f64 = total_cs_i[energy_index] * g;
-        let p_coll: f64 = 1.0 - (-nu * DT_I).exp();
-        if rng.gen::<f64>() < p_coll {
-            collision_ion(cs, Particle, vxa, vya, vza, k, energy_index, rng);
-            *N_coll += 1;
-        }
-    }
+                let nu: f64 = total_cs_i[energy_index] * g;
+                let p_coll: f64 = 1.0 - (-nu * DT_I).exp();
+                if rng.gen::<f64>() < p_coll {
+                    collision_ion_par(cs, part, vxa, vya, vza, energy_index, rng);
+                    1u64
+                } else {
+                    0u64
+                }
+            },
+        )
+        .sum();
+    *N_coll += n;
 }
 
 
@@ -506,8 +516,11 @@ fn check_collisions_i(Particle:&mut Vec<ParticleType>, total_cs_i:&Vec<f64>, cs:
 // e / Ar collision                                                     //
 //----------------------------------------------------------------------//
 
-fn collision_electron(Electrons:&mut Vec<ParticleType>, Ions:&mut Vec<ParticleType>,
-    cs:&Vec<Vec<f64>>, particle_index:usize, eindex: usize, rng: &mut ThreadRng) 
+// Refactored: operates on a single &mut ParticleType and returns newly created
+// (electron, ion) pair on ionization, so it is safe to call from a parallel context.
+fn collision_electron_par(electron:&mut ParticleType,
+    cs:&Vec<Vec<f64>>, eindex: usize, rng: &mut ThreadRng)
+    -> Option<(ParticleType, ParticleType)>
 {
     let normal_range = Normal::new(0.0, (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt()).unwrap();
     let f1 = E_MASS / (E_MASS + AR_MASS);
@@ -515,14 +528,14 @@ fn collision_electron(Electrons:&mut Vec<ParticleType>, Ions:&mut Vec<ParticleTy
     let t0: f64 = cs[E_ELA][eindex];
     let t1: f64 = t0 + cs[E_EXC][eindex];
     let t2: f64 = t1 + cs[E_ION][eindex];
-    
+
     let mut energy: f64 = 0.0;
     let mut e_new: f64  = 0.0;
     let mut e_orig: f64 = 0.0;
 
-    let mut gx: f64 = Electrons[particle_index].vx;  // relative velocity in cold gas approximation
-    let mut gy: f64 = Electrons[particle_index].vy;
-    let mut gz: f64 = Electrons[particle_index].vz;
+    let mut gx: f64 = electron.vx;
+    let mut gy: f64 = electron.vy;
+    let mut gz: f64 = electron.vz;
     let mut g: f64  = ( gx.powf(2.0) + gy.powf(2.0) + gz.powf(2.0) ).sqrt();
     let wx: f64 = f1 * gx;
     let wy: f64 = f1 * gy;
@@ -531,7 +544,7 @@ fn collision_electron(Electrons:&mut Vec<ParticleType>, Ions:&mut Vec<ParticleTy
     // find Euler angles:
     let phi: f64;
     let theta: f64;
-    if gx == 0.0 { theta = 0.5 * PI; } 
+    if gx == 0.0 { theta = 0.5 * PI; }
     else { theta = ((gy * gy + gz * gz).sqrt()).atan2(gx); }
     if gy == 0.0 {
         if gz > 0.0 { phi = 0.5 * PI; } else { phi = -0.5 * PI; }
@@ -552,6 +565,9 @@ fn collision_electron(Electrons:&mut Vec<ParticleType>, Ions:&mut Vec<ParticleTy
     let ct: f64 = theta.cos();
     let sp: f64 = phi.sin();
     let cp: f64 = phi.cos();
+
+    // newly created (electron, ion) pair from ionization, if it occurs
+    let mut new_particles: Option<(ParticleType, ParticleType)> = None;
 
     let rnd:f64 = rng.gen::<f64>();
     if rnd < t0 / t2 {                                    // elastic scattering
@@ -578,21 +594,23 @@ fn collision_electron(Electrons:&mut Vec<ParticleType>, Ions:&mut Vec<ParticleTy
         cc = chi_new.cos();
         se = eta_new.sin();
         ce = eta_new.cos();
-        gx = g_new * (ct * cc - st * sc * ce);
-        gy = g_new * (st * cp * cc + ct * cp * sc * ce - sp * sc * se);
-        gz = g_new * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
-        Electrons.push(ParticleType{
-            x : Electrons[particle_index].x,
-            vx: (wx + f2 * gx),
-            vy: (wy + f2 * gy),
-            vz: (wz + f2 * gz)
-        });
-        Ions.push(ParticleType{
-            x : Electrons[particle_index].x,
-            vx: (rng.sample(&normal_range)),
-            vy: (rng.sample(&normal_range)),
-            vz: (rng.sample(&normal_range))
-        });
+        let gnx = g_new * (ct * cc - st * sc * ce);
+        let gny = g_new * (st * cp * cc + ct * cp * sc * ce - sp * sc * se);
+        let gnz = g_new * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
+        new_particles = Some((
+            ParticleType {
+                x : electron.x,
+                vx: wx + f2 * gnx,
+                vy: wy + f2 * gny,
+                vz: wz + f2 * gnz,
+            },
+            ParticleType {
+                x : electron.x,
+                vx: rng.sample(&normal_range),
+                vy: rng.sample(&normal_range),
+                vz: rng.sample(&normal_range),
+            },
+        ));
     }
 
     // scatter the incoming electron
@@ -609,28 +627,60 @@ fn collision_electron(Electrons:&mut Vec<ParticleType>, Ions:&mut Vec<ParticleTy
     gz = g * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
 
     // post-collision velocity of the electron
+    electron.vx = wx + f2 * gx;
+    electron.vy = wy + f2 * gy;
+    electron.vz = wz + f2 * gz;
 
-    Electrons[particle_index].vx = wx + f2 * gx;
-    Electrons[particle_index].vy = wy + f2 * gy;
-    Electrons[particle_index].vz = wz + f2 * gz;
+    new_particles
 }
 
-fn check_collisions_e(Electrons: &mut Vec<ParticleType>, Ions: &mut Vec<ParticleType>, 
-    total_cs_e:&Vec<f64>, cs:&Vec<Vec<f64>>, N_coll: &mut u64, rng: &mut ThreadRng) 
+// Parallelized: each electron's collision is processed independently.
+// Ionization events (rare) produce new particle pairs that are collected and
+// appended to the particle vectors after the parallel phase — no allocations
+// proportional to the total particle count, only to the ionization count.
+fn check_collisions_e(Electrons: &mut Vec<ParticleType>, Ions: &mut Vec<ParticleType>,
+    total_cs_e:&Vec<f64>, cs:&Vec<Vec<f64>>, N_coll: &mut u64)
 {
-    let N_e:usize = Electrons.len();
-    for k in 0..N_e {
-        let v2 = Electrons[k].vx.powf(2.0) + Electrons[k].vy.powf(2.0) + Electrons[k].vz.powf(2.0);
-        let velocity: f64 = v2.sqrt();
-        let energy: f64 = 0.5 * E_MASS * v2 / EV_TO_J;
-        let energy_index = core::cmp::min((energy / (DE_CS as f64) + 0.5).trunc() as usize, (CS_RANGES-1) as usize);
+    // Phase 1 (parallel): process collisions in place; collect new-particle pairs
+    // from ionization events and count all collisions across threads.
+    let (n_coll, new_pairs): (u64, Vec<(ParticleType, ParticleType)>) = Electrons
+        .par_iter_mut()
+        .map_init(
+            || rand::thread_rng(),
+            |rng, electron| {
+                let v2 = electron.vx.powf(2.0) + electron.vy.powf(2.0) + electron.vz.powf(2.0);
+                let velocity: f64 = v2.sqrt();
+                let energy: f64 = 0.5 * E_MASS * v2 / EV_TO_J;
+                let energy_index = core::cmp::min(
+                    (energy / DE_CS + 0.5).trunc() as usize, CS_RANGES - 1);
+                let nu: f64 = total_cs_e[energy_index] * velocity;
+                let p_coll: f64 = 1.0 - (-nu * DT_E).exp();
+                if rng.gen::<f64>() < p_coll {
+                    let new_pair = collision_electron_par(electron, cs, energy_index, rng);
+                    (1u64, new_pair)
+                } else {
+                    (0u64, None)
+                }
+            },
+        )
+        .fold(
+            || (0u64, Vec::new()),
+            |(cnt, mut pairs), (collided, pair)| {
+                let cnt = cnt + collided;
+                if let Some(p) = pair { pairs.push(p); }
+                (cnt, pairs)
+            },
+        )
+        .reduce(
+            || (0u64, Vec::new()),
+            |(c1, mut p1), (c2, p2)| { p1.extend(p2); (c1 + c2, p1) },
+        );
 
-        let nu: f64 = total_cs_e[energy_index] * velocity;
-        let p_coll: f64 = 1.0 - (-nu * DT_E).exp();
-        if rng.gen::<f64>() < p_coll {  
-            collision_electron(Electrons, Ions, cs, k, energy_index, rng);
-            *N_coll += 1;
-        }
+    // Phase 2 (sequential): append newly created particles from ionization.
+    *N_coll += n_coll;
+    for (new_e, new_ion) in new_pairs {
+        Electrons.push(new_e);
+        Ions.push(new_ion);
     }
 }
 
@@ -734,20 +784,34 @@ fn solve_poisson(pot: &mut Vec<f64>, efield: &mut Vec<f64>, rho: &Vec<f64>, pot0
 
 fn get_density(density:&mut Vec<f64>, cumul_density:&mut Vec<f64>, Particle:&Vec<ParticleType>)
 {
-    *density=vec![0.0;N_G];
-
     let c: f64 = WEIGHT / (ELECTRODE_AREA * DX);
-    for p in Particle.iter(){
-        let q:usize  = (p.x * INV_DX).trunc() as usize;
-        let rem:f64  = p.x * INV_DX - (q as f64);
-        density[q]   += (1.0-rem) * c;
-        density[q+1] += rem * c;
-    }
- 
+
+    // Parallel fold: each thread accumulates into a local N_G-length array,
+    // then the per-thread arrays are summed in the reduce step.
+    *density = Particle
+        .par_iter()
+        .fold(
+            || vec![0.0f64; N_G],
+            |mut local, p| {
+                let q   = (p.x * INV_DX).trunc() as usize;
+                let rem = p.x * INV_DX - (q as f64);
+                local[q]   += (1.0 - rem) * c;
+                local[q+1] += rem * c;
+                local
+            },
+        )
+        .reduce(
+            || vec![0.0f64; N_G],
+            |mut a, b| {
+                for (ai, bi) in a.iter_mut().zip(b.iter()) { *ai += bi; }
+                a
+            },
+        );
+
     density[0]     *= 2.0;
     density[N_G-1] *= 2.0;
 
-    *cumul_density = cumul_density.iter().zip(density.iter()).map(|(x,y)| (y+x)).collect();
+    for (cd, d) in cumul_density.iter_mut().zip(density.iter()) { *cd += d; }
 }
 
 
@@ -834,17 +898,18 @@ fn calc_fed(fed_pow:&Vec<u64>, fed_gnd:&Vec<u64>, mean_energy_pow:&mut f64, mean
 
 fn calc_current_and_power(j_xt:&mut Vec<Vec<f64>>, pow_xt:&mut Vec<Vec<f64>>, u_xt:&Vec<Vec<f64>>, n_xt:&Vec<Vec<f64>>, c_xt:&Vec<Vec<f64>>, efield_xt:&Vec<Vec<f64>>, charge:f64, norm:f64)-> std::io::Result<()>
 {
-    let mut factor:f64;
-    let mut u:f64;
-    for i in 0..N_XT {
-        for j in 0..N_G {
-            factor = c_xt[i][j];
-            if factor > 0.0 {factor = 1.0/factor;} else {factor = 0.0;}
-            u = u_xt[i][j] * factor;
-            j_xt[i][j]   = charge * u * n_xt[i][j] * norm;
-            pow_xt[i][j] = j_xt[i][j] * efield_xt[i][j] * norm;
-        }
-    }
+    // Each time-bin row is independent — parallelize over N_XT rows.
+    j_xt.par_iter_mut()
+        .zip(pow_xt.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, (j_row, pow_row))| {
+            for j in 0..N_G {
+                let factor = if c_xt[i][j] > 0.0 { 1.0 / c_xt[i][j] } else { 0.0 };
+                let u = u_xt[i][j] * factor;
+                j_row[j]   = charge * u * n_xt[i][j] * norm;
+                pow_row[j] = j_row[j] * efield_xt[i][j] * norm;
+            }
+        });
     Ok(())
 }
 // formatted output of cumulative densities
