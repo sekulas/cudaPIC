@@ -146,11 +146,6 @@ fn main(){
         }
     }
 
-    ThreadPoolBuilder::new()
-        .num_threads(rayon_threads)
-        .build_global()
-        .expect(">> eduPIC: ERROR = failed to initialize Rayon thread pool");
-
     println!(">> eduPIC: starting...");
     println!(">> eduPIC: **************************************************************************");
     println!(">> eduPIC: Copyright (C) 2021 Z. Donko et al.");
