@@ -40,6 +40,7 @@ sbatch <<EOF
 #SBATCH -c ${THREADS}
 #SBATCH --hint=nomultithread
 #SBATCH --sockets-per-node=1
+#SBATCH --distribution=block:block
 #SBATCH --output="${RUN_DIR}/slurm_%j.out"
 #SBATCH --error="${RUN_DIR}/slurm_%j.err"
 
