@@ -39,6 +39,7 @@ sbatch <<EOF
 #SBATCH --ntasks=1
 #SBATCH -c ${THREADS}
 #SBATCH --hint=nomultithread
+#SBATCH --sockets-per-node=1
 #SBATCH --output="${RUN_DIR}/slurm_%j.out"
 #SBATCH --error="${RUN_DIR}/slurm_%j.err"
 
