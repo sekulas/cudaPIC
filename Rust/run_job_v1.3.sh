@@ -38,9 +38,9 @@ sbatch <<EOF
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH -c ${THREADS}
-#SBATCH --hint=nomultithread
 #SBATCH --sockets-per-node=1
-#SBATCH --distribution=block:block
+#SBATCH --cores-per-socket=${THREADS}
+#SBATCH --mem-bind=local
 #SBATCH --output="${RUN_DIR}/slurm_%j.out"
 #SBATCH --error="${RUN_DIR}/slurm_%j.err"
 
