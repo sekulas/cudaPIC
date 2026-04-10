@@ -38,7 +38,6 @@ use std::io::Write;
 use std::env;
 use std::time::Instant;
 use rayon::prelude::*;
-use rayon::ThreadPoolBuilder;
 
 // constants
 
@@ -75,7 +74,6 @@ const DX: f64              = L / ((N_G - 1) as f64);                   // spatia
 const INV_DX: f64          = 1.0 / DX;                                 // inverse of spatial grid size [1/m]
 const GAS_DENSITY: f64     = PRESSURE / (K_BOLTZMANN * TEMPERATURE);   // background gas gas density [m-3]
 const OMEGA: f64           = TWO_PI * FREQUENCY;                       // angular frequency [rad/s]
-const DEFAULT_RAYON_THREADS: usize = 2;                                // default number of Rayon worker threads
 
 // electron and ion cross sections
 
@@ -116,8 +114,7 @@ struct ParticleType {                                // coordinates of particles
 // main                                                                                     //
 // command line arguments:                                                                  //
 // [1]: number of cycles (0 for init)                                                       //
-// [2..]: optional arguments: "m" turns on data collection and saving, integer sets Rayon  //
-//        thread count                                                                      //
+// [2]: "m" turns on data collection and saving                                             //
 //------------------------------------------------------------------------------------------//
 
 fn main(){
@@ -129,22 +126,7 @@ fn main(){
     let mut cycles_done:usize = 0;
 
     let mut measurement:bool = false;
-    let mut rayon_threads: usize = DEFAULT_RAYON_THREADS;
-    for arg in args.iter().skip(2) {
-        if arg == "m" {
-            measurement = true;
-        } else if let Ok(value) = arg.parse::<usize>() {
-            if value == 0 {
-                println!(">> eduPIC: ERROR = Rayon thread count must be at least 1");
-                std::process::exit(1);
-            }
-            rayon_threads = value;
-        } else {
-            println!(">> eduPIC: ERROR = unknown argument '{}'", arg);
-            println!(">> eduPIC: Usage: ./eduPIC <cycles> [m] [rayon_threads]");
-            std::process::exit(1);
-        }
-    }
+    if (args.len() > 2) && (args[2].parse::<String>().unwrap() == "m") { measurement = true; }
 
     println!(">> eduPIC: starting...");
     println!(">> eduPIC: **************************************************************************");
@@ -153,7 +135,6 @@ fn main(){
     println!(">> eduPIC: This is free software, you are welcome to use, modify and redistribute it");
     println!(">> eduPIC: according to the GNU General Public License, https://www.gnu.org/licenses/");
     println!(">> eduPIC: **************************************************************************");
-    println!(">> eduPIC: rayon threads: {}", rayon_threads);
     println!(">> eduPIC: available threads: {}", rayon::current_num_threads());
     println!(">> eduPIC: available CPUs: {}", num_cpus::get());
     println!(">> eduPIC: available physical CPUs: {}", num_cpus::get_physical());
