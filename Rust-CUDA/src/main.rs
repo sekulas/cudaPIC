@@ -13,7 +13,7 @@ use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use std::env;
 use std::time::Instant;
 
-/// simulation precision
+/// Simulation precision: change to f32 for single-precision GPU computation.
 type Real = f64;
 
 // constants
@@ -292,11 +292,33 @@ mod kernels {
     use super::*;
 
     #[kernel]
-    pub fn stub(mut out: DisjointSlice<Real>) {
-        let idx = thread::index_1d();
-        if let Some(elem) = out.get_mut(idx) {
-            *elem = 1.0 as Real;
+    pub fn move_particles(
+        efield: &[Real], 
+        mut x: DisjointSlice<Real>, 
+        mut vx: DisjointSlice<Real>, 
+        n_active: &[u32], 
+        factor: Real, // precomputed: DT_E * (-E_CHARGE) / E_MASS
+        dt: Real      // DT_E
+    ) { 
+        if thread::index_1d().get() >= n_active[0] as usize {
+            return;
         }
+
+        if let Some((x_val, idx)) = x.get_mut_indexed() {
+            if let Some(vx_val) = vx.get_mut(idx) {
+                let pos = *x_val * INV_DX as Real;
+                let p = pos as u32;
+                let c2 = pos - p as Real;
+                let e_x = (1.0 as Real - c2) * efield[p as usize] + c2 * efield[(p + 1) as usize];
+
+                let new_vx = *vx_val + factor * e_x;
+                let new_x = *x_val + new_vx * dt;
+
+                *vx_val = new_vx;
+                *x_val = new_x;
+            }
+        }
+
     }
 
     // TODO: push_particles (leapfrog integrator / ...)
@@ -467,20 +489,25 @@ fn main() {
     // 7. GPU simulation loop
     // all kernels launched on same stream
     println!(">> eduPIC-GPU: running {} cycles × {} steps (GPU-resident)...", num_cycles, N_T);
+    let module = kernels::load(&ctx).expect("Failed to load CUDA module");
 
-    // for _cycle in 0..num_cycles {
-    //     for _t in 0..N_T {
-    //         // module.deposit_charge_e(&stream, cfg, ...)?;
-    //         // module.deposit_charge_i(&stream, cfg, ...)?;
-    //         // module.solve_poisson(&stream, poisson_cfg, ...)?;
-    //         // module.push_electrons(&stream, cfg, ...)?;
-    //         // if t % N_SUB == 0 { module.push_ions(&stream, cfg, ...)?; }
-    //         // module.check_boundaries_e(&stream, cfg, ...)?;
-    //         // module.check_boundaries_i(&stream, cfg, ...)?;
-    //         // module.collisions_e(&stream, cfg, ...)?;  // ionization appends directly
-    //         // if t % N_SUB == 0 { module.collisions_i(&stream, cfg, ...)?; }
-    //     }
-    // }
+    for _cycle in 0..num_cycles {
+        for _t in 0..N_T {
+            module.move_particles(&stream, cfg, 
+                    &gpu.efield, &mut gpu.e_x, &mut gpu.e_vx, &gpu.n_electrons, 
+                    (DT_E * (-E_CHARGE) / E_MASS) as Real, DT_E as Real
+                ).expect("Failed to launch move_particles kernel");
+            // module.deposit_charge_e(&stream, cfg, ...)?;
+            // module.deposit_charge_i(&stream, cfg, ...)?;
+            // module.solve_poisson(&stream, poisson_cfg, ...)?;
+            // module.push_electrons(&stream, cfg, ...)?;
+            // if t % N_SUB == 0 { module.push_ions(&stream, cfg, ...)?; }
+            // module.check_boundaries_e(&stream, cfg, ...)?;
+            // module.check_boundaries_i(&stream, cfg, ...)?;
+            // module.collisions_e(&stream, cfg, ...)?;  // ionization appends directly
+            // if t % N_SUB == 0 { module.collisions_i(&stream, cfg, ...)?; }
+        }
+    }
 
     // 8. Synchronize and download results
     ctx.synchronize().expect("CUDA synchronization failed");
