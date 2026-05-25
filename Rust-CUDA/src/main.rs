@@ -13,6 +13,9 @@ use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use std::env;
 use std::time::Instant;
 
+/// simulation precision
+type Real = f64;
+
 // constants
 
 const PI: f64              = 3.141592653589793;      // mathematical constant Pi
@@ -77,6 +80,12 @@ const N_XT: usize          = (N_T / N_BIN) as usize; // number of spatial bins f
 
 const MAX_PARTICLES: usize = 120_000;                // maximum number of particles per species (pre-allocated on GPU).
 const MAX_PARTICLES_U32: u32 = MAX_PARTICLES as u32; // used for LaunchConfig::for_num_elems
+const N_SPECIES: usize        = 2;                    // electrons + ions
+const PARTICLE_COMPS: usize   = 4;                    // arrays per species: x, vx, vy, vz
+const N_GRID_ARRAYS: usize    = 5;                    // efield, pot, rho, e_density, i_density
+const RNG_STATE_COMPS: usize  = 4;                    // xoshiro256** state: 4 × u64 per particle
+const SIZEOF_REAL: usize      = std::mem::size_of::<Real>();  // adapts to Real precision
+const BYTES_PER_MB: f64       = 1_048_576.0;          // 1024 × 1024
 
 // cross section precomputation strategy:
 // TODO: verify true branch
@@ -87,19 +96,19 @@ const PRECOMPUTE_COLLISION_FREQ: bool = false;
 // SoA particle data - host-side representation
 
 struct ParticlesSoA {                                // Host-side SoA container for particle data.
-    x:  Vec<f64>,
-    vx: Vec<f64>,
-    vy: Vec<f64>,
-    vz: Vec<f64>,
+    x:  Vec<Real>,
+    vx: Vec<Real>,
+    vy: Vec<Real>,
+    vz: Vec<Real>,
 }
 
 impl ParticlesSoA {
     fn with_capacity(cap: usize) -> Self {
         Self {
-            x:  vec![0.0; cap],
-            vx: vec![0.0; cap],
-            vy: vec![0.0; cap],
-            vz: vec![0.0; cap],
+            x:  vec![0.0 as Real; cap],
+            vx: vec![0.0 as Real; cap],
+            vy: vec![0.0 as Real; cap],
+            vz: vec![0.0 as Real; cap],
         }
     }
 
@@ -113,16 +122,16 @@ impl ParticlesSoA {
 
 struct GpuSimState {
     // electron particle arrays (pre-allocated to MAX_PARTICLES)
-    e_x:  DeviceBuffer<f64>,
-    e_vx: DeviceBuffer<f64>,
-    e_vy: DeviceBuffer<f64>,
-    e_vz: DeviceBuffer<f64>,
+    e_x:  DeviceBuffer<Real>,
+    e_vx: DeviceBuffer<Real>,
+    e_vy: DeviceBuffer<Real>,
+    e_vz: DeviceBuffer<Real>,
 
     // ion particle arrays (pre-allocated to MAX_PARTICLES)
-    i_x:  DeviceBuffer<f64>,
-    i_vx: DeviceBuffer<f64>,
-    i_vy: DeviceBuffer<f64>,
-    i_vz: DeviceBuffer<f64>,
+    i_x:  DeviceBuffer<Real>,
+    i_vx: DeviceBuffer<Real>,
+    i_vy: DeviceBuffer<Real>,
+    i_vz: DeviceBuffer<Real>,
 
     // active particle counters (atomic on GPU)
     // pattern: pass as &[u32] to kernel, cast to DeviceAtomicU32 inside.
@@ -131,21 +140,21 @@ struct GpuSimState {
     n_ions:      DeviceBuffer<u32>,  // n_ions[0] = active ion count
 
     // grid quantities (fixed size N_G = 400)
-    efield:    DeviceBuffer<f64>,    // electric field [V/m]
-    pot:       DeviceBuffer<f64>,    // electric potential [V]
-    rho:       DeviceBuffer<f64>,    // charge density [C/m³]
-    e_density: DeviceBuffer<f64>,    // electron density [m⁻³]
-    i_density: DeviceBuffer<f64>,    // ion density [m⁻³]
+    efield:    DeviceBuffer<Real>,    // electric field [V/m]
+    pot:       DeviceBuffer<Real>,    // electric potential [V]
+    rho:       DeviceBuffer<Real>,    // charge density [C/m³]
+    e_density: DeviceBuffer<Real>,    // electron density [m⁻³]
+    i_density: DeviceBuffer<Real>,    // ion density [m⁻³]
 
     // cross sections (read-only after upload, 5 × CS_RANGES entries)
     // flattened 2D: cs[process][energy_index] → cs[process * CS_RANGES + energy_index]
-    cs: DeviceBuffer<f64>,
+    cs: DeviceBuffer<Real>,
 
     // total cross sections for null-collision method.
     // If PRECOMPUTE_COLLISION_FREQ: stores ν(E) = Σσ(E) × v(E) × n_gas  (kernel: nu = table[idx])
     // If !PRECOMPUTE_COLLISION_FREQ: stores Σσ(E) × n_gas               (kernel: nu = table[idx] * v)
-    sigma_tot_e: DeviceBuffer<f64>,  // [CS_RANGES]
-    sigma_tot_i: DeviceBuffer<f64>,  // [CS_RANGES]
+    sigma_tot_e: DeviceBuffer<Real>,  // [CS_RANGES]
+    sigma_tot_i: DeviceBuffer<Real>,  // [CS_RANGES]
 
     // RNG state per-particle
     // flattened: rng_state[particle_idx * 4 + component]
@@ -157,33 +166,33 @@ impl GpuSimState {
     fn allocate(stream: &cuda_core::CudaStream) -> Result<Self, cuda_core::DriverError> {
         Ok(Self {
             // particle arrays
-            e_x:  DeviceBuffer::<f64>::zeroed(stream, MAX_PARTICLES)?,
-            e_vx: DeviceBuffer::<f64>::zeroed(stream, MAX_PARTICLES)?,
-            e_vy: DeviceBuffer::<f64>::zeroed(stream, MAX_PARTICLES)?,
-            e_vz: DeviceBuffer::<f64>::zeroed(stream, MAX_PARTICLES)?,
+            e_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            e_vx: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            e_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            e_vz: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
 
-            i_x:  DeviceBuffer::<f64>::zeroed(stream, MAX_PARTICLES)?,
-            i_vx: DeviceBuffer::<f64>::zeroed(stream, MAX_PARTICLES)?,
-            i_vy: DeviceBuffer::<f64>::zeroed(stream, MAX_PARTICLES)?,
-            i_vz: DeviceBuffer::<f64>::zeroed(stream, MAX_PARTICLES)?,
+            i_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            i_vx: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            i_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            i_vz: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
 
             // atomic counters
             n_electrons: DeviceBuffer::<u32>::zeroed(stream, 1)?,
             n_ions:      DeviceBuffer::<u32>::zeroed(stream, 1)?,
 
             // grid arrays
-            efield:    DeviceBuffer::<f64>::zeroed(stream, N_G)?,
-            pot:       DeviceBuffer::<f64>::zeroed(stream, N_G)?,
-            rho:       DeviceBuffer::<f64>::zeroed(stream, N_G)?,
-            e_density: DeviceBuffer::<f64>::zeroed(stream, N_G)?,
-            i_density: DeviceBuffer::<f64>::zeroed(stream, N_G)?,
+            efield:    DeviceBuffer::<Real>::zeroed(stream, N_G)?,
+            pot:       DeviceBuffer::<Real>::zeroed(stream, N_G)?,
+            rho:       DeviceBuffer::<Real>::zeroed(stream, N_G)?,
+            e_density: DeviceBuffer::<Real>::zeroed(stream, N_G)?,
+            i_density: DeviceBuffer::<Real>::zeroed(stream, N_G)?,
 
             // cross sections: flattened [N_CS × CS_RANGES]
-            cs: DeviceBuffer::<f64>::zeroed(stream, N_CS * CS_RANGES)?,
+            cs: DeviceBuffer::<Real>::zeroed(stream, N_CS * CS_RANGES)?,
 
             // total cross sections
-            sigma_tot_e: DeviceBuffer::<f64>::zeroed(stream, CS_RANGES)?,
-            sigma_tot_i: DeviceBuffer::<f64>::zeroed(stream, CS_RANGES)?,
+            sigma_tot_e: DeviceBuffer::<Real>::zeroed(stream, CS_RANGES)?,
+            sigma_tot_i: DeviceBuffer::<Real>::zeroed(stream, CS_RANGES)?,
 
             // RNG state: 4 × u64 per particle
             // TODO xoshiro256** - verify
@@ -227,9 +236,9 @@ impl GpuSimState {
     fn upload_cross_sections(
         &mut self,
         stream: &cuda_core::CudaStream,
-        cs_flat: &[f64],        // [N_CS * CS_RANGES]
-        sigma_tot_e: &[f64],    // [CS_RANGES]
-        sigma_tot_i: &[f64],    // [CS_RANGES]
+        cs_flat: &[Real],        // [N_CS * CS_RANGES]
+        sigma_tot_e: &[Real],    // [CS_RANGES]
+        sigma_tot_i: &[Real],    // [CS_RANGES]
     ) -> Result<(), cuda_core::DriverError> {
         self.cs          = DeviceBuffer::from_host(stream, cs_flat)?;
         self.sigma_tot_e = DeviceBuffer::from_host(stream, sigma_tot_e)?;
@@ -283,10 +292,10 @@ mod kernels {
     use super::*;
 
     #[kernel]
-    pub fn stub(mut out: DisjointSlice<f64>) {
+    pub fn stub(mut out: DisjointSlice<Real>) {
         let idx = thread::index_1d();
         if let Some(elem) = out.get_mut(idx) {
-            *elem = 1.0;
+            *elem = 1.0 as Real;
         }
     }
 
@@ -300,11 +309,13 @@ mod kernels {
 
 // Host-side initialization helpers
 
-fn init_cross_sections() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut cs_flat = vec![0.0; N_CS * CS_RANGES];
-    let mut sigma_tot_e = vec![0.0; CS_RANGES];
-    let mut sigma_tot_i = vec![0.0; CS_RANGES];
+fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
+    let mut cs_flat = vec![0.0 as Real; N_CS * CS_RANGES];
+    let mut sigma_tot_e = vec![0.0 as Real; CS_RANGES];
+    let mut sigma_tot_i = vec![0.0 as Real; CS_RANGES];
 
+    // Cross-section formulas always computed in f64 for numerical accuracy,
+    // then stored as Real for GPU consumption.
     let qmom = |e: f64| -> f64 {
         1.0e-20 * (
             (6.0 / (1.0 + e / 0.1 + (e / 0.6).powf(2.0)).powf(3.3)
@@ -345,32 +356,32 @@ fn init_cross_sections() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     for i in 0..CS_RANGES {
         let e = if i == 0 { DE_CS } else { (i as f64) * DE_CS };
 
-        cs_flat[E_ELA * CS_RANGES + i] = qmom(e);
-        cs_flat[E_EXC * CS_RANGES + i] = qexc(e);
-        cs_flat[E_ION * CS_RANGES + i] = qion(e);
-        cs_flat[I_ISO * CS_RANGES + i] = qiso(2.0 * e);
-        cs_flat[I_BACK * CS_RANGES + i] = qchx(2.0 * e);
+        cs_flat[E_ELA * CS_RANGES + i] = qmom(e) as Real;
+        cs_flat[E_EXC * CS_RANGES + i] = qexc(e) as Real;
+        cs_flat[E_ION * CS_RANGES + i] = qion(e) as Real;
+        cs_flat[I_ISO * CS_RANGES + i] = qiso(2.0 * e) as Real;
+        cs_flat[I_BACK * CS_RANGES + i] = qchx(2.0 * e) as Real;
     }
 
     for i in 0..CS_RANGES {
         let e = if i == 0 { DE_CS } else { (i as f64) * DE_CS };
 
-        let sum_e = cs_flat[E_ELA * CS_RANGES + i]
-                  + cs_flat[E_EXC * CS_RANGES + i]
-                  + cs_flat[E_ION * CS_RANGES + i];
+        let sum_e = cs_flat[E_ELA * CS_RANGES + i] as f64
+                  + cs_flat[E_EXC * CS_RANGES + i] as f64
+                  + cs_flat[E_ION * CS_RANGES + i] as f64;
 
-        let sum_i = cs_flat[I_ISO * CS_RANGES + i]
-                  + cs_flat[I_BACK * CS_RANGES + i];
+        let sum_i = cs_flat[I_ISO * CS_RANGES + i] as f64
+                  + cs_flat[I_BACK * CS_RANGES + i] as f64;
 
         // TODO: verify true branch
         if PRECOMPUTE_COLLISION_FREQ {
             let v_e = (2.0 * e * EV_TO_J / E_MASS).sqrt();
             let v_i = (2.0 * e * EV_TO_J / MU_ARAR).sqrt();
-            sigma_tot_e[i] = sum_e * v_e * GAS_DENSITY;
-            sigma_tot_i[i] = sum_i * v_i * GAS_DENSITY;
+            sigma_tot_e[i] = (sum_e * v_e * GAS_DENSITY) as Real;
+            sigma_tot_i[i] = (sum_i * v_i * GAS_DENSITY) as Real;
         } else {
-            sigma_tot_e[i] = sum_e * GAS_DENSITY;
-            sigma_tot_i[i] = sum_i * GAS_DENSITY;
+            sigma_tot_e[i] = (sum_e * GAS_DENSITY) as Real;
+            sigma_tot_i[i] = (sum_i * GAS_DENSITY) as Real;
         }
     }
 
@@ -428,12 +439,12 @@ fn main() {
     let mut gpu = GpuSimState::allocate(&stream)
         .expect("Failed to allocate GPU memory");
     println!(">> eduPIC-GPU: GPU memory allocated (~{:.1} MB)",
-        (MAX_PARTICLES * 4 * 8 * 2       // particles (e + i)
-        + N_CS * CS_RANGES * 8             // cross sections
-        + CS_RANGES * 8 * 2                // sigma_tot
-        + N_G * 5 * 8                      // grid
-        + MAX_PARTICLES * 4 * 8            // RNG state
-        ) as f64 / 1_048_576.0
+        (MAX_PARTICLES * PARTICLE_COMPS * SIZEOF_REAL * N_SPECIES  // particles (e + i)
+        + N_CS * CS_RANGES * SIZEOF_REAL                            // cross sections
+        + CS_RANGES * SIZEOF_REAL * N_SPECIES                       // sigma_tot_e + sigma_tot_i
+        + N_G * N_GRID_ARRAYS * SIZEOF_REAL                         // grid arrays
+        + MAX_PARTICLES * RNG_STATE_COMPS * 8                       // RNG state (always u64)
+        ) as f64 / BYTES_PER_MB
     );
 
     // 5. Upload data to GPU (one-time PCIe transfer)
