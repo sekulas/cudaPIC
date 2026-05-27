@@ -293,7 +293,7 @@ impl GpuSimState {
 #[cuda_module]
 mod kernels {
     use super::*;
-    
+
     #[kernel]
     pub fn move_particles(
         efield:   &[Real],
@@ -326,12 +326,41 @@ mod kernels {
 
             if let Some(vx_val) = vx.get_mut(idx) {
                 let pos = *x_val * INV_DX as Real;
-                let p   = pos as usize;
+                let p   = pos as usize;                
                 let c2  = pos - p as Real;
                 let e_x = unsafe {
                     (1.0 as Real - c2) * EFIELD_SHARED[p]
                         + c2 * EFIELD_SHARED[p + 1]
                 };
+
+                let new_vx = *vx_val + factor * e_x;
+                *vx_val = new_vx;
+                *x_val  = *x_val + new_vx * dt;
+            }
+        }
+    }
+
+    // TODO - no shmem perf testing
+    #[kernel]
+    pub fn OLD_move_particles(
+        efield:   &[Real],
+        mut x:    DisjointSlice<Real>,
+        mut vx:   DisjointSlice<Real>,
+        n_active: u32,
+        factor:   Real,
+        dt:       Real,
+    ) {
+        if let Some((x_val, idx)) = x.get_mut_indexed() {
+            let i = idx.get();
+            if i >= n_active as usize {
+                return;
+            }
+            if let Some(vx_val) = vx.get_mut(idx) {
+                let pos = *x_val * INV_DX as Real;
+                let p   = pos as usize;                
+                let c2  = pos - p as Real;
+                let e_x = (1.0 as Real - c2) * efield[p]
+                        + c2 * efield[p + 1];
 
                 let new_vx = *vx_val + factor * e_x;
                 *vx_val = new_vx;
@@ -549,6 +578,7 @@ fn main() {
 
 fn perform_tests() {
     test_move_particles();
+    bench_shmem_vs_no_shmem();
 }
 
 fn test_move_particles() {
@@ -609,4 +639,63 @@ fn test_move_particles() {
         println!("move_particles: {} mismatches", errors);
         std::process::exit(1);
     }
+}
+
+// timing benchmark: shared-memory vs. no-shared-memory particle pusher
+fn bench_shmem_vs_no_shmem() {
+    const N: usize     = MAX_PARTICLES;
+    const REPS: u32    = 1000;
+
+    let ctx    = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let module = kernels::load(&ctx).unwrap();
+    let cfg    = LaunchConfig::for_num_elems(N as u32);
+
+    // random positions across [0, L], random velocities
+    let efield_host: Vec<Real> = (0..N_G).map(|i| 100.0 * (i as Real / N_G as Real)).collect();
+    let x_init:  Vec<Real> = (0..N).map(|i| L as Real * (i as Real / N as Real)).collect();
+    let vx_init: Vec<Real> = (0..N).map(|i| 1000.0 * ((i as Real) - N as Real / 2.0)).collect();
+
+    let efield_dev       = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
+    let mut x_shmem      = DeviceBuffer::from_host(&stream, &x_init).unwrap();
+    let mut vx_shmem     = DeviceBuffer::from_host(&stream, &vx_init).unwrap();
+    let mut x_no_shmem   = DeviceBuffer::from_host(&stream, &x_init).unwrap();
+    let mut vx_no_shmem  = DeviceBuffer::from_host(&stream, &vx_init).unwrap();
+
+    let factor = FACTOR_E as Real;
+    
+    // dt = 0 freezes positions across launches so particles never leave [0, L].
+    let dt = 0.0 as Real;
+
+    // warm-up (avoids JIT / driver overhead in measurements) TODO - verify if needed
+    for _ in 0..10 {
+        module.move_particles(&stream, cfg,
+            &efield_dev, &mut x_shmem, &mut vx_shmem, N as u32, factor, dt).unwrap();
+        module.OLD_move_particles(&stream, cfg,
+            &efield_dev, &mut x_no_shmem, &mut vx_no_shmem, N as u32, factor, dt).unwrap();
+    }
+    ctx.synchronize().unwrap();
+
+    // time shared-memory variant
+    let t0 = Instant::now();
+    for _ in 0..REPS {
+        module.move_particles(&stream, cfg,
+            &efield_dev, &mut x_shmem, &mut vx_shmem, N as u32, factor, dt).unwrap();
+    }
+    ctx.synchronize().unwrap();
+    let t_shmem = t0.elapsed().as_secs_f64() / REPS as f64 * 1e6; // µs per launch
+
+    // time no-shared-memory variant
+    let t0 = Instant::now();
+    for _ in 0..REPS {
+        module.OLD_move_particles(&stream, cfg,
+            &efield_dev, &mut x_no_shmem, &mut vx_no_shmem, N as u32, factor, dt).unwrap();
+    }
+    ctx.synchronize().unwrap();
+    let t_no_shmem = t0.elapsed().as_secs_f64() / REPS as f64 * 1e6;
+
+    println!(">> bench move_particles ({} particles, {} reps):", N, REPS);
+    println!("     shared memory : {:.2} µs/launch", t_shmem);
+    println!("     no shared mem : {:.2} µs/launch", t_no_shmem);
+    println!("     speedup       : {:.2}×", t_no_shmem / t_shmem);
 }
