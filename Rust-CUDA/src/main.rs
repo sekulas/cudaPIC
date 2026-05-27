@@ -428,9 +428,10 @@ fn generate_rng_seeds(n: usize) -> Vec<u64> {
 }
 
 fn main() {
+    perform_tests();
+
     println!(">> eduPIC-GPU: starting...");
     println!(">> eduPIC-GPU: cuda-oxide parallel PIC/MCC simulation");
-
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: edupic-gpu <num_cycles>");
@@ -520,4 +521,71 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64();
     println!(">> eduPIC-GPU: simulation complete in {:.3} s", elapsed);
     println!(">> eduPIC-GPU: final particles: {} electrons, {} ions", n_e_final, n_i_final);
+}
+
+// tests
+
+fn perform_tests() {
+    test_move_particles();
+}
+
+fn test_move_particles() {
+    let n_test: usize = 1000;
+    let mut x_host  = vec![0.0f64; n_test];
+    let mut vx_host = vec![0.0f64; n_test];
+    let efield_host: Vec<f64> = (0..N_G).map(|i| 100.0 * (i as f64 / N_G as f64)).collect();
+
+    for i in 0..n_test {
+        x_host[i] = L * (i as f64 + 0.5) / n_test as f64;
+        vx_host[i] = 1000.0 * (i as f64 - n_test as f64 / 2.0);
+    }
+
+    // CPU oracle
+    let factor = DT_E * (-E_CHARGE) / E_MASS;
+    let mut x_cpu = x_host.clone();
+    let mut vx_cpu = vx_host.clone();
+    for i in 0..n_test {
+        let p = (x_cpu[i] * INV_DX) as usize;
+        let c2 = x_cpu[i] * INV_DX - p as f64;
+        let e_x = (1.0 - c2) * efield_host[p] + c2 * efield_host[p + 1];
+        vx_cpu[i] += factor * e_x;
+        x_cpu[i] += vx_cpu[i] * DT_E;
+    }
+
+    // GPU execution
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let efield_dev = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
+    let mut x_dev = DeviceBuffer::from_host(&stream, &x_host).unwrap();
+    let mut vx_dev = DeviceBuffer::from_host(&stream, &vx_host).unwrap();
+    let n_active_dev = DeviceBuffer::from_host(&stream, &[n_test as u32]).unwrap();
+
+    let module = kernels::load(&ctx).unwrap();
+    let cfg = LaunchConfig::for_num_elems(n_test as u32);
+    module.move_particles(&stream, cfg,
+        &efield_dev, &mut x_dev, &mut vx_dev, &n_active_dev,
+        factor, DT_E
+    ).unwrap();
+
+    // compare
+    let x_gpu = x_dev.to_host_vec(&stream).unwrap();
+    let vx_gpu = vx_dev.to_host_vec(&stream).unwrap();
+
+    let eps = 1e-10;  // f64 tolerance
+    let mut errors = 0;
+    for i in 0..n_test {
+        if (x_gpu[i] - x_cpu[i]).abs() > eps {
+            eprintln!("x[{}]: GPU={:.15e} CPU={:.15e} diff={:.2e}", i, x_gpu[i], x_cpu[i], (x_gpu[i]-x_cpu[i]).abs());
+            errors += 1;
+        }
+        if (vx_gpu[i] - vx_cpu[i]).abs() > eps {
+            eprintln!("vx[{}]: GPU={:.15e} CPU={:.15e} diff={:.2e}", i, vx_gpu[i], vx_cpu[i], (vx_gpu[i]-vx_cpu[i]).abs());
+            errors += 1;
+        }
+    }
+
+    if errors > 0 {
+        println!("move_particles: {} mismatches", errors);
+        std::process::exit(1);
+    }
 }
