@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
-use cuda_device::{cuda_module, kernel, thread, DisjointSlice};
+use cuda_device::{cuda_module, kernel, thread, DisjointSlice, SharedArray};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use std::env;
 use std::time::Instant;
@@ -89,9 +89,12 @@ const BYTES_PER_MB: f64       = 1_048_576.0;          // 1024 × 1024
 
 // cross section precomputation strategy:
 // TODO: verify true branch
-// - true:  sigma_tot = Σσ × v(E) × n_gas  → kernel just reads nu directly (no sqrt)
-// - false: sigma_tot = Σσ × n_gas          → kernel must compute v and multiply (like original eduPIC)
+// - true:  sigma_tot = Σσ × v(E) × n_gas   - kernel just reads nu directly (no sqrt)
+// - false: sigma_tot = Σσ × n_gas          - kernel must compute v and multiply (like original eduPIC)
 const PRECOMPUTE_COLLISION_FREQ: bool = false;
+
+const FACTOR_E: f64 = DT_E / E_MASS * (-E_CHARGE);  // leapfrog acceleration factor for electrons [m/s per (V/m)]
+const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;    // leapfrog acceleration factor for ions [m/s per (V/m)]
 
 // SoA particle data - host-side representation
 
@@ -290,38 +293,53 @@ impl GpuSimState {
 #[cuda_module]
 mod kernels {
     use super::*;
-
+    
     #[kernel]
     pub fn move_particles(
-        efield: &[Real], 
-        mut x: DisjointSlice<Real>, 
-        mut vx: DisjointSlice<Real>, 
-        n_active: &[u32], 
-        factor: Real, // precomputed: DT_E * (-E_CHARGE) / E_MASS
-        dt: Real      // DT_E
-    ) { 
-        if thread::index_1d().get() >= n_active[0] as usize {
-            return;
+        efield:   &[Real],
+        mut x:    DisjointSlice<Real>,
+        mut vx:   DisjointSlice<Real>,
+        n_active: u32,
+        factor:   Real,
+        dt:       Real,
+    ) {
+        // E-field loaded cooperatively into shared memory once per block,
+        // eliminating repeated global memory reads.
+        static mut EFIELD_SHARED: SharedArray<Real, N_G> = SharedArray::UNINIT;
+
+        let tid        = thread::threadIdx_x() as usize;
+        let block_size = thread::blockDim_x()  as usize;
+
+        // Each thread loads ceil(N_G / block_size) elements.
+        let mut k = tid;
+        while k < N_G {
+            unsafe { EFIELD_SHARED[k] = efield[k]; }
+            k += block_size;
         }
+        thread::sync_threads();
 
         if let Some((x_val, idx)) = x.get_mut_indexed() {
+            let i = idx.get();
+            if i >= n_active as usize {
+                return;
+            }
+
             if let Some(vx_val) = vx.get_mut(idx) {
                 let pos = *x_val * INV_DX as Real;
-                let p = pos as u32;
-                let c2 = pos - p as Real;
-                let e_x = (1.0 as Real - c2) * efield[p as usize] + c2 * efield[(p + 1) as usize];
+                let p   = pos as usize;
+                let c2  = pos - p as Real;
+                let e_x = unsafe {
+                    (1.0 as Real - c2) * EFIELD_SHARED[p]
+                        + c2 * EFIELD_SHARED[p + 1]
+                };
 
                 let new_vx = *vx_val + factor * e_x;
-                let new_x = *x_val + new_vx * dt;
-
                 *vx_val = new_vx;
-                *x_val = new_x;
+                *x_val  = *x_val + new_vx * dt;
             }
         }
-
     }
 
-    // TODO: push_particles (leapfrog integrator / ...)
     // TODO: deposit_charge (density accumulation with atomics / ...)
     // TODO: solve_poisson (parallel tridiagonal / prefix-sum solver / ...)
     // TODO: check_boundaries (stream compaction / ...)
@@ -491,22 +509,26 @@ fn main() {
     // all kernels launched on same stream
     println!(">> eduPIC-GPU: running {} cycles × {} steps (GPU-resident)...", num_cycles, N_T);
     let module = kernels::load(&ctx).expect("Failed to load CUDA module");
-
+    
     for _cycle in 0..num_cycles {
         for _t in 0..N_T {
-            module.move_particles(&stream, cfg, 
-                    &gpu.efield, &mut gpu.e_x, &mut gpu.e_vx, &gpu.n_electrons, 
-                    (DT_E * (-E_CHARGE) / E_MASS) as Real, DT_E as Real
-                ).expect("Failed to launch move_particles kernel");
+            module.move_particles(&stream, cfg,
+                &gpu.efield, &mut gpu.e_x, &mut gpu.e_vx,
+                n_init_active, FACTOR_E as Real, DT_E as Real,
+            ).expect("move_particles (electrons) failed");
             // module.deposit_charge_e(&stream, cfg, ...)?;
             // module.deposit_charge_i(&stream, cfg, ...)?;
             // module.solve_poisson(&stream, poisson_cfg, ...)?;
-            // module.push_electrons(&stream, cfg, ...)?;
-            // if t % N_SUB == 0 { module.push_ions(&stream, cfg, ...)?; }
+            // if _t % N_SUB == 0 {
+            //     module.move_particles(&stream, cfg,
+            //         &gpu.efield, &mut gpu.i_x, &mut gpu.i_vx,
+            //         n_init_active, FACTOR_I as Real, DT_I as Real,
+            //     ).expect("move_particles (ions) failed");
+            // }
             // module.check_boundaries_e(&stream, cfg, ...)?;
             // module.check_boundaries_i(&stream, cfg, ...)?;
             // module.collisions_e(&stream, cfg, ...)?;  // ionization appends directly
-            // if t % N_SUB == 0 { module.collisions_i(&stream, cfg, ...)?; }
+            // if _t % N_SUB == 0 { module.collisions_i(&stream, cfg, ...)?; }
         }
     }
 
@@ -541,14 +563,13 @@ fn test_move_particles() {
     }
 
     // CPU oracle
-    let factor = DT_E * (-E_CHARGE) / E_MASS;
     let mut x_cpu = x_host.clone();
     let mut vx_cpu = vx_host.clone();
     for i in 0..n_test {
         let p = (x_cpu[i] * INV_DX) as usize;
         let c2 = x_cpu[i] * INV_DX - p as f64;
         let e_x = (1.0 - c2) * efield_host[p] + c2 * efield_host[p + 1];
-        vx_cpu[i] += factor * e_x;
+        vx_cpu[i] += FACTOR_E * e_x;
         x_cpu[i] += vx_cpu[i] * DT_E;
     }
 
@@ -558,13 +579,13 @@ fn test_move_particles() {
     let efield_dev = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
     let mut x_dev = DeviceBuffer::from_host(&stream, &x_host).unwrap();
     let mut vx_dev = DeviceBuffer::from_host(&stream, &vx_host).unwrap();
-    let n_active_dev = DeviceBuffer::from_host(&stream, &[n_test as u32]).unwrap();
-
     let module = kernels::load(&ctx).unwrap();
     let cfg = LaunchConfig::for_num_elems(n_test as u32);
     module.move_particles(&stream, cfg,
-        &efield_dev, &mut x_dev, &mut vx_dev, &n_active_dev,
-        factor, DT_E
+        &efield_dev, &mut x_dev, &mut vx_dev,
+        n_test as u32,
+        FACTOR_E as Real,
+        DT_E as Real,
     ).unwrap();
 
     // compare
