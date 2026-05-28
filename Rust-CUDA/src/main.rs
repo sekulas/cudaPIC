@@ -577,8 +577,120 @@ fn main() {
 // tests
 
 fn perform_tests() {
+    test_move_particles_analytic();
+    test_move_particles_edge_cases();
     test_move_particles();
     bench_shmem_vs_no_shmem();
+}
+
+// expected result is computable without oracle
+fn test_move_particles_analytic() {
+    const E_UNIFORM: f64 = 100.0;
+    let efield_host = vec![E_UNIFORM as Real; N_G];
+
+    let n: usize = 10;
+    let x_host:  Vec<Real> = (0..n).map(|i| L as Real * (i as Real + 0.5) / n as Real).collect();
+    let vx_host: Vec<Real> = (0..n).map(|i| (i as Real - n as Real / 2.0) * 1e5).collect();
+
+    let ctx    = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let efield_dev  = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
+    let mut x_dev   = DeviceBuffer::from_host(&stream, &x_host).unwrap();
+    let mut vx_dev  = DeviceBuffer::from_host(&stream, &vx_host).unwrap();
+    let module = kernels::load(&ctx).unwrap();
+    let cfg    = LaunchConfig::for_num_elems(n as u32);
+    module.move_particles(&stream, cfg,
+        &efield_dev, &mut x_dev, &mut vx_dev,
+        n as u32, FACTOR_E as Real, DT_E as Real,
+    ).unwrap();
+
+    let x_gpu  = x_dev.to_host_vec(&stream).unwrap();
+    let vx_gpu = vx_dev.to_host_vec(&stream).unwrap();
+
+    // analytic expected values:
+    //   new_vx = vx_0 + FACTOR_E * E_UNIFORM
+    //   new_x  = x_0  + new_vx * DT_E
+    let eps = 1e-12;
+    let mut errors = 0;
+    for i in 0..n {
+        let expected_vx = vx_host[i] as f64 + FACTOR_E * E_UNIFORM;
+        let expected_x  = x_host[i]  as f64 + expected_vx * DT_E;
+        if (vx_gpu[i] as f64 - expected_vx).abs() > eps {
+            eprintln!("analytic vx[{}]: got={:.15e} expected={:.15e}", i, vx_gpu[i], expected_vx);
+            errors += 1;
+        }
+        if (x_gpu[i] as f64 - expected_x).abs() > eps {
+            eprintln!("analytic x[{}]: got={:.15e} expected={:.15e}", i, x_gpu[i], expected_x);
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        println!("test_move_particles_analytic: {} mismatches", errors);
+        std::process::exit(1);
+    }
+}
+
+fn test_move_particles_edge_cases() {
+    let efield_host: Vec<Real> = (0..N_G).map(|i| (i as Real + 1.0) * 50.0).collect();
+
+    // case A: particle exactly on a grid node (c2 = 0, e_x = efield[p] exactly)
+    // case B: particle near right boundary
+    // case C: zero velocity particle (new_x changes only from field acceleration)
+    let x_cases:  Vec<Real> = vec![
+        10.0 * DX as Real,                      // A: exactly on node 10
+        398.5 * DX as Real,                     // B: near right boundary
+        L as Real * 0.5,                        // C: midpoint, vx = 0
+    ];
+    let vx_cases: Vec<Real> = vec![
+        1e4,   // A
+        1e4,   // B
+        0.0,   // C: zero velocity
+    ];
+    let n = x_cases.len();
+
+    // CPU oracle
+    let mut x_cpu  = x_cases.clone();
+    let mut vx_cpu = vx_cases.clone();
+    for i in 0..n {
+        let p   = (x_cpu[i] as f64 * INV_DX) as usize;
+        let c2  = x_cpu[i] as f64 * INV_DX - p as f64;
+        let e_x = (1.0 - c2) * efield_host[p] as f64 + c2 * efield_host[p + 1] as f64;
+        vx_cpu[i] = (vx_cpu[i] as f64 + FACTOR_E * e_x) as Real;
+        x_cpu[i]  = (x_cpu[i]  as f64 + vx_cpu[i] as f64 * DT_E) as Real;
+    }
+
+    let ctx    = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let efield_dev  = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
+    let mut x_dev   = DeviceBuffer::from_host(&stream, &x_cases.clone()).unwrap();
+    let mut vx_dev  = DeviceBuffer::from_host(&stream, &vx_cases).unwrap();
+    let module = kernels::load(&ctx).unwrap();
+    let cfg    = LaunchConfig::for_num_elems(n as u32);
+    module.move_particles(&stream, cfg,
+        &efield_dev, &mut x_dev, &mut vx_dev,
+        n as u32, FACTOR_E as Real, DT_E as Real,
+    ).unwrap();
+
+    let x_gpu  = x_dev.to_host_vec(&stream).unwrap();
+    let vx_gpu = vx_dev.to_host_vec(&stream).unwrap();
+
+    let eps = 1e-10;
+    let labels = ["grid_node", "near_boundary", "zero_vx"];
+    let mut errors = 0;
+    for i in 0..n {
+        if (x_gpu[i] as f64 - x_cpu[i] as f64).abs() > eps {
+            eprintln!("edge[{}] x:  GPU={:.15e} CPU={:.15e}", labels[i], x_gpu[i], x_cpu[i]);
+            errors += 1;
+        }
+        if (vx_gpu[i] as f64 - vx_cpu[i] as f64).abs() > eps {
+            eprintln!("edge[{}] vx: GPU={:.15e} CPU={:.15e}", labels[i], vx_gpu[i], vx_cpu[i]);
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        println!("test_move_particles_edge_cases: {} mismatches", errors);
+        std::process::exit(1);
+    }
 }
 
 fn test_move_particles() {
