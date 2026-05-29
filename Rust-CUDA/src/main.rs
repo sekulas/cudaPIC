@@ -585,8 +585,8 @@ fn perform_tests() {
 
 // expected result is computable without oracle
 fn test_move_particles_analytic() {
-    const E_UNIFORM: f64 = 100.0;
-    let efield_host = vec![E_UNIFORM as Real; N_G];
+    const E_UNIFORM: Real = 100.0;
+    let efield_host = vec![E_UNIFORM; N_G];
 
     let n: usize = 10;
     let x_host:  Vec<Real> = (0..n).map(|i| L as Real * (i as Real + 0.5) / n as Real).collect();
@@ -610,16 +610,16 @@ fn test_move_particles_analytic() {
     // analytic expected values:
     //   new_vx = vx_0 + FACTOR_E * E_UNIFORM
     //   new_x  = x_0  + new_vx * DT_E
-    let eps = 1e-12;
+    let eps: Real = if std::mem::size_of::<Real>() == 4 { 1e-5 as Real } else { 1e-10 as Real };
     let mut errors = 0;
     for i in 0..n {
-        let expected_vx = vx_host[i] as f64 + FACTOR_E * E_UNIFORM;
-        let expected_x  = x_host[i]  as f64 + expected_vx * DT_E;
-        if (vx_gpu[i] as f64 - expected_vx).abs() > eps {
+        let expected_vx = vx_host[i] + FACTOR_E as Real * E_UNIFORM;
+        let expected_x  = x_host[i]  + expected_vx * DT_E as Real;
+        if (vx_gpu[i] - expected_vx).abs() > eps {
             eprintln!("analytic vx[{}]: got={:.15e} expected={:.15e}", i, vx_gpu[i], expected_vx);
             errors += 1;
         }
-        if (x_gpu[i] as f64 - expected_x).abs() > eps {
+        if (x_gpu[i] - expected_x).abs() > eps {
             eprintln!("analytic x[{}]: got={:.15e} expected={:.15e}", i, x_gpu[i], expected_x);
             errors += 1;
         }
@@ -652,11 +652,11 @@ fn test_move_particles_edge_cases() {
     let mut x_cpu  = x_cases.clone();
     let mut vx_cpu = vx_cases.clone();
     for i in 0..n {
-        let p   = (x_cpu[i] as f64 * INV_DX) as usize;
-        let c2  = x_cpu[i] as f64 * INV_DX - p as f64;
-        let e_x = (1.0 - c2) * efield_host[p] as f64 + c2 * efield_host[p + 1] as f64;
-        vx_cpu[i] = (vx_cpu[i] as f64 + FACTOR_E * e_x) as Real;
-        x_cpu[i]  = (x_cpu[i]  as f64 + vx_cpu[i] as f64 * DT_E) as Real;
+        let p   = (x_cpu[i] * INV_DX as Real) as usize;
+        let c2  = x_cpu[i] * INV_DX as Real - p as Real;
+        let e_x = (1.0 as Real - c2) * efield_host[p] + c2 * efield_host[p + 1];
+        vx_cpu[i] = vx_cpu[i] + FACTOR_E as Real * e_x;
+        x_cpu[i]  = x_cpu[i]  + vx_cpu[i] * DT_E as Real;
     }
 
     let ctx    = CudaContext::new(0).unwrap();
@@ -674,15 +674,15 @@ fn test_move_particles_edge_cases() {
     let x_gpu  = x_dev.to_host_vec(&stream).unwrap();
     let vx_gpu = vx_dev.to_host_vec(&stream).unwrap();
 
-    let eps = 1e-10;
+    let eps: Real = if std::mem::size_of::<Real>() == 4 { 1e-5 as Real } else { 1e-10 as Real };
     let labels = ["grid_node", "near_boundary", "zero_vx"];
     let mut errors = 0;
     for i in 0..n {
-        if (x_gpu[i] as f64 - x_cpu[i] as f64).abs() > eps {
+        if (x_gpu[i] - x_cpu[i]).abs() > eps {
             eprintln!("edge[{}] x:  GPU={:.15e} CPU={:.15e}", labels[i], x_gpu[i], x_cpu[i]);
             errors += 1;
         }
-        if (vx_gpu[i] as f64 - vx_cpu[i] as f64).abs() > eps {
+        if (vx_gpu[i] - vx_cpu[i]).abs() > eps {
             eprintln!("edge[{}] vx: GPU={:.15e} CPU={:.15e}", labels[i], vx_gpu[i], vx_cpu[i]);
             errors += 1;
         }
@@ -695,24 +695,24 @@ fn test_move_particles_edge_cases() {
 
 fn test_move_particles() {
     let n_test: usize = 1000;
-    let mut x_host  = vec![0.0f64; n_test];
-    let mut vx_host = vec![0.0f64; n_test];
-    let efield_host: Vec<f64> = (0..N_G).map(|i| 100.0 * (i as f64 / N_G as f64)).collect();
+    let mut x_host  = vec![0.0 as Real; n_test];
+    let mut vx_host = vec![0.0 as Real; n_test];
+    let efield_host: Vec<Real> = (0..N_G).map(|i| 100.0 * (i as Real / N_G as Real)).collect();
 
     for i in 0..n_test {
-        x_host[i] = L * (i as f64 + 0.5) / n_test as f64;
-        vx_host[i] = 1000.0 * (i as f64 - n_test as f64 / 2.0);
+        x_host[i] = (L * (i as f64 + 0.5) / n_test as f64) as Real;
+        vx_host[i] = (1000.0 * (i as f64 - n_test as f64 / 2.0)) as Real;
     }
 
     // CPU oracle
     let mut x_cpu = x_host.clone();
     let mut vx_cpu = vx_host.clone();
     for i in 0..n_test {
-        let p = (x_cpu[i] * INV_DX) as usize;
-        let c2 = x_cpu[i] * INV_DX - p as f64;
-        let e_x = (1.0 - c2) * efield_host[p] + c2 * efield_host[p + 1];
-        vx_cpu[i] += FACTOR_E * e_x;
-        x_cpu[i] += vx_cpu[i] * DT_E;
+        let p = (x_cpu[i] * INV_DX as Real) as usize;
+        let c2 = x_cpu[i] * INV_DX as Real - p as Real;
+        let e_x = (1.0 as Real - c2) * efield_host[p] + c2 * efield_host[p + 1];
+        vx_cpu[i] += FACTOR_E as Real * e_x;
+        x_cpu[i] += vx_cpu[i] * DT_E as Real;
     }
 
     // GPU execution
@@ -734,7 +734,7 @@ fn test_move_particles() {
     let x_gpu = x_dev.to_host_vec(&stream).unwrap();
     let vx_gpu = vx_dev.to_host_vec(&stream).unwrap();
 
-    let eps = 1e-10;  // f64 tolerance
+    let eps: Real = if std::mem::size_of::<Real>() == 4 { 1e-5 as Real } else { 1e-10 as Real };
     let mut errors = 0;
     for i in 0..n_test {
         if (x_gpu[i] - x_cpu[i]).abs() > eps {
