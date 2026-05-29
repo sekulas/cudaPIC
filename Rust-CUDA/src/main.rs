@@ -10,6 +10,8 @@
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{cuda_module, kernel, thread, DisjointSlice, SharedArray};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+use rand::RngExt;
+use rand_distr::Normal;
 use std::env;
 use std::time::Instant;
 
@@ -378,6 +380,28 @@ mod kernels {
 
 // Host-side initialization helpers
 
+fn init_particles(n: usize) -> ParticlesSoA {
+    let mut rng = rand::rng();
+    let sigma_v = (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt();
+    let normal  = Normal::new(0.0f64, sigma_v).unwrap();
+
+    let mut particles = ParticlesSoA {
+        x:  vec![0.0 as Real; n],
+        vx: vec![0.0 as Real; n],
+        vy: vec![0.0 as Real; n],
+        vz: vec![0.0 as Real; n],
+    };
+
+    for i in 0..n {
+        particles.x[i]  = (rng.random::<f64>() * L) as Real;
+        particles.vx[i] = rng.sample(normal) as Real;
+        particles.vy[i] = rng.sample(normal) as Real;
+        particles.vz[i] = rng.sample(normal) as Real;
+    }
+
+    particles
+}
+
 fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
     let mut cs_flat = vec![0.0 as Real; N_CS * CS_RANGES];
     let mut sigma_tot_e = vec![0.0 as Real; CS_RANGES];
@@ -486,12 +510,9 @@ fn main() {
     println!(">> eduPIC-GPU: cross-sections computed ({} entries per process)", CS_RANGES);
 
     // 3. Initialize particles on CPU (SoA layout)
-    let mut electrons_host = ParticlesSoA::with_capacity(MAX_PARTICLES);
-    let mut ions_host = ParticlesSoA::with_capacity(MAX_PARTICLES);
-
-    // Populate first N_INIT particles (uniform random positions, thermal velocities)
-    // TODO: replace with proper initialization from original eduPIC logic
-    let n_init_active = N_INIT as u32;
+    let electrons_host = init_particles(N_INIT);
+    let ions_host      = init_particles(N_INIT);
+    let n_init_active  = N_INIT as u32;
 
     // 4. Allocate all GPU buffers
     let mut gpu = GpuSimState::allocate(&stream)
