@@ -384,43 +384,31 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
     let mut sigma_tot_i = vec![0.0 as Real; CS_RANGES];
 
     // Cross-section formulas always computed in f64 for numerical accuracy,
-    // then stored as Real for GPU consumption.
+    // then stored as Real for GPU consumption. // TODO - verify if this is necessary or if we can compute directly in Real (f32) for single-precision GPU.
     let qmom = |e: f64| -> f64 {
-        1.0e-20 * (
-            (6.0 / (1.0 + e / 0.1 + (e / 0.6).powf(2.0)).powf(3.3)
-             - 1.1 * e.powf(1.4) / (1.0 + (e / 15.0).powf(1.2))
-               / (1.0 + (e / 5.5).powf(2.5) + (e / 60.0).powf(4.1)).sqrt()
-            ).abs()
-            + 0.05 / (1.0 + e / 10.0).powf(2.0)
-            + 0.01 * e.powf(3.0) / (1.0 + (e / 12.0).powf(6.0))
-        )
+        1.0e-20*(
+        (6.0/(1.0+e/0.1+(e/0.6).powf(2.0)).powf(3.3)-1.1*e.powf(1.4)/
+        (1.0+(e/15.0).powf(1.2))/(1.0+(e/5.5).powf(2.5)+(e/60.0).powf(4.1)).sqrt()).abs()+0.05/(1.0+e/10.0).powf(2.0)+
+        0.01*e.powf(3.0)/(1.0+(e/12.0).powf(6.0)))
     };
 
     let qexc = |e: f64| -> f64 {
-        if e <= E_EXC_TH { 0.0 }
-        else {
-            (0.034 * (e - 11.5).powf(1.1) * (1.0 + (e / 15.0).powf(2.8))
-             / (1.0 + (e / 23.0).powf(5.5))
-             + 0.023 * (e - 11.5) / (1.0 + e / 80.0).powf(1.9)) * 1.0e-20
-        }
+        if e <= E_EXC_TH{0.0} else {(0.034 * (e - 11.5).powf(1.1) * (1.0 + (e / 15.0).powf(2.8))
+        / (1.0 + (e / 23.0).powf(5.5)) + 0.023 * (e - 11.5) / (1.0 + e / 80.0).powf(1.9))*1.0e-20 }
     };
 
     let qion = |e: f64| -> f64 {
-        if e <= E_ION_TH { 0.0 }
-        else {
-            (970.0 * (e - 15.8) / (70.0 + e).powf(2.0)
-             + 0.06 * (e - 15.8).powf(2.0) * (-e / 9.0).exp()) * 1.0e-20
-        }
+        if e <= E_ION_TH{0.0} else {(970.0 * (e - 15.8) / (70.0 + e).powf(2.0)
+        + 0.06 * (e - 15.8).powf(2.0) * (-e / 9.0).exp())*1.0e-20 }
     };
 
-    let qmoi = |e_lab: f64| -> f64 {                                        //2*e!
-        1.15e-18 * e_lab.powf(-0.1) * (1.0 + 0.015 / e_lab).powf(0.6)
+    let qmoi = |e_lab: f64| -> f64 {
+        1.15e-18 * e_lab.powf(-0.1) * (1.0 + 0.015 / e_lab).powf(0.6) //2*e!
     };
     let qiso = |e_lab: f64| -> f64 {
-        2.0e-19 * e_lab.powf(-0.5) / (1.0 + e_lab)
-        + 3.0e-19 * e_lab / (1.0 + e_lab / 3.0).powf(2.0)
+        2.0e-19 * e_lab.powf(-0.5) / (1.0 + e_lab) + 3.0e-19 * e_lab / (1.0 + e_lab / 3.0).powf(2.0)
     };
-    let qchx = |e_lab: f64| -> f64 { 0.5 * (qmoi(e_lab) - qiso(e_lab)) };
+    let qchx = |e_lab: f64| -> f64 { 0.5*(qmoi(e_lab)-qiso(e_lab)) };
 
     for i in 0..CS_RANGES {
         let e = if i == 0 { DE_CS } else { (i as f64) * DE_CS };
