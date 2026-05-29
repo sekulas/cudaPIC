@@ -371,8 +371,8 @@ mod kernels {
         }
     }
 
-    // TODO: deposit_charge (density accumulation with atomics / ...)
-    // TODO: solve_poisson (parallel tridiagonal / prefix-sum solver / ...)
+    // TODO: deposit_charge (density accumulation with atomics / ...)  // TODO - verify if there we can use f32 (no risks?)
+    // TODO: solve_poisson (parallel tridiagonal / prefix-sum solver / ...) // TODO - verify if there we can use f32 (no risks?)
     // TODO: check_boundaries (stream compaction / ...)
     // TODO: collisions_e (electron-neutral MCC, ionization appends directly / ...)
     // TODO: collisions_i (ion-neutral MCC / ...)
