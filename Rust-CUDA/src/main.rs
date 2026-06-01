@@ -371,7 +371,12 @@ mod kernels {
         }
     }
 
-    // TODO: deposit_charge (density accumulation with atomics / ...)  // TODO - verify if there we can use f32 (no risks?)
+    #[kernel]
+    pub fn zero_density(mut density: DisjointSlice<Real>) {
+        if let Some(val) = density.get_mut(thread::index_1d()) {
+            *val = 0.0 as Real;
+        }
+    }
     // TODO: solve_poisson (parallel tridiagonal / prefix-sum solver / ...) // TODO - verify if there we can use f32 (no risks?)
     // TODO: check_boundaries (stream compaction / ...)
     // TODO: collisions_e (electron-neutral MCC, ionization appends directly / ...)
