@@ -7,9 +7,9 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{memory, CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{cuda_module, kernel, thread, DisjointSlice, SharedArray};
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
+use cuda_device::atomic::{AtomicOrdering, BlockAtomicF64, DeviceAtomicF64};
 use rand::RngExt;
 use rand_distr::Normal;
 use std::env;
@@ -97,6 +97,7 @@ const PRECOMPUTE_COLLISION_FREQ: bool = false;
 
 const FACTOR_E: f64 = DT_E / E_MASS * (-E_CHARGE);  // leapfrog acceleration factor for electrons [m/s per (V/m)]
 const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;    // leapfrog acceleration factor for ions [m/s per (V/m)]
+const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);
 
 // SoA particle data - host-side representation
 
@@ -372,11 +373,59 @@ mod kernels {
     }
 
     #[kernel]
-    pub fn zero_density(mut density: DisjointSlice<Real>) {
-        if let Some(val) = density.get_mut(thread::index_1d()) {
-            *val = 0.0 as Real;
+    pub fn get_density(
+        x:             &[Real],
+        density:       &[Real],
+        n_active:      u32,
+    ) {
+        static mut LOCAL_DENSITY: SharedArray<Real, N_G> = SharedArray::UNINIT;
+
+        let tid        = thread::threadIdx_x() as usize;
+        let block_size = thread::blockDim_x()  as usize;
+
+        let mut k = tid;
+        while k < N_G {
+            unsafe { LOCAL_DENSITY[k] = 0.0 as Real; }
+            k += block_size;
+        }
+        thread::sync_threads();
+
+        // Charge to shared histogram | Block-scope atomics
+        let i = thread::index_1d().get();
+        if i < n_active as usize {
+            let pos = x[i] * INV_DX as Real;
+            let q   = pos as usize;
+            let rem  = pos - q as Real;
+            let c1   = (1.0 as Real - rem) * WEIGHT_FACTOR;
+            let c2   = rem * WEIGHT_FACTOR;
+
+            unsafe {
+                let p: *mut SharedArray<Real, N_G> = &raw mut LOCAL_DENSITY;
+                let local_base = (*p).as_mut_ptr() as *const BlockAtomicF64; // TODO - F32 Atomic??
+
+                (*local_base.add(q    )).fetch_add(c1, AtomicOrdering::Relaxed);
+                (*local_base.add(q + 1)).fetch_add(c2, AtomicOrdering::Relaxed);
+            };
+        }
+        thread::sync_threads();
+
+        // Flush to global density | Device-scope atomics
+        let global_density = density.as_ptr() as *const DeviceAtomicF64; // TODO - F32 Atomic??
+        let mut k = tid;
+        while k < N_G {
+            let mut val = unsafe { LOCAL_DENSITY[k] };
+            if val != 0.0 as Real { // TODO - Nie potrzebne jak sortowanie??
+                if k == 0 || k == N_G - 1 {
+                    val *= 2.0 as Real;
+                }
+                unsafe {
+                    (*global_density.add(k)).fetch_add(val, AtomicOrdering::Relaxed);
+                }
+            }
+            k += block_size;
         }
     }
+
     // TODO: solve_poisson (parallel tridiagonal / prefix-sum solver / ...) // TODO - verify if there we can use f32 (no risks?)
     // TODO: check_boundaries (stream compaction / ...)
     // TODO: collisions_e (electron-neutral MCC, ionization appends directly / ...)
@@ -559,6 +608,14 @@ fn main() {
                 &gpu.efield, &mut gpu.e_x, &mut gpu.e_vx,
                 n_init_active, FACTOR_E as Real, DT_E as Real,
             ).expect("move_particles (electrons) failed");
+            // zero density buffers
+            unsafe {
+                memory::memset_d8_async(gpu.e_density.cu_deviceptr(), 0, gpu.e_density.num_bytes(), stream.cu_stream()).expect("memset e_density failed");
+                memory::memset_d8_async(gpu.i_density.cu_deviceptr(), 0, gpu.i_density.num_bytes(), stream.cu_stream()).expect("memset i_density failed");
+            }
+            module.get_density(&stream, cfg,
+                &gpu.e_x, &gpu.e_density, n_init_active,
+            ).expect("get_density (electrons) failed");
             // module.deposit_charge_e(&stream, cfg, ...)?;
             // module.deposit_charge_i(&stream, cfg, ...)?;
             // module.solve_poisson(&stream, poisson_cfg, ...)?;
@@ -595,6 +652,8 @@ fn perform_tests() {
     test_move_particles_edge_cases();
     test_move_particles();
     bench_shmem_vs_no_shmem();
+    test_deposit_charge_analytic();
+    test_deposit_charge();
 }
 
 // expected result is computable without oracle
@@ -824,4 +883,109 @@ fn bench_shmem_vs_no_shmem() {
     println!("     shared memory : {:.2} µs/launch", t_shmem);
     println!("     no shared mem : {:.2} µs/launch", t_no_shmem);
     println!("     speedup       : {:.2}×", t_no_shmem / t_shmem);
+}
+
+// run zero_density + deposit_charge
+fn run_deposit_on_gpu(x_host: &[Real]) -> Vec<Real> {
+    let ctx    = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let module = kernels::load(&ctx).unwrap();
+
+    let x_dev = DeviceBuffer::from_host(&stream, x_host).unwrap();
+    let density_dev = DeviceBuffer::<Real>::zeroed(&stream, N_G).unwrap();
+
+    let cfg_deposit = LaunchConfig::for_num_elems(x_host.len() as u32);
+
+    module.get_density(
+        &stream, cfg_deposit,
+        &x_dev, &density_dev, x_host.len() as u32,
+    ).unwrap();
+
+    density_dev.to_host_vec(&stream).unwrap()
+}
+
+fn cpu_get_density(x_host: &[Real]) -> Vec<Real> {
+    let mut density = vec![0.0 as Real; N_G];
+    let c: Real = (WEIGHT / (ELECTRODE_AREA * DX)) as Real;
+    for &xi in x_host {
+        let pos = xi * INV_DX as Real;
+        let q   = pos as usize;
+        let rem = pos - q as Real;
+        density[q]     += (1.0 as Real - rem) * c;
+        density[q + 1] += rem * c;
+    }
+    density[0]       *= 2.0 as Real;
+    density[N_G - 1] *= 2.0 as Real;
+    density
+}
+
+fn test_deposit_charge_analytic() {
+    let c: Real = (WEIGHT / (ELECTRODE_AREA * DX)) as Real;
+    let x_host: Vec<Real> = vec![
+        100.5 * DX as Real,
+        50.0  * DX as Real,
+        0.5   * DX as Real,
+        ((N_G - 2) as Real + 0.5) * DX as Real,
+    ];
+
+    let gpu = run_deposit_on_gpu(&x_host);
+    let expected = cpu_get_density(&x_host);
+
+    let eps: Real = if std::mem::size_of::<Real>() == 4 { 1e-4 as Real * c } else { 1e-10 as Real * c };
+    let mut errors = 0;
+    for i in 0..N_G {
+        if (gpu[i] - expected[i]).abs() > eps {
+            eprintln!("deposit_analytic[{}]: GPU={:.6e} expected={:.6e}", i, gpu[i], expected[i]);
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        println!("test_deposit_charge_analytic: {} mismatches", errors);
+        std::process::exit(1);
+    }
+}
+
+fn test_deposit_charge() {
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    const N_PART: usize = 100_000;
+    let mut rng = StdRng::seed_from_u64(0xC2DAu64);
+
+    let x_host: Vec<Real> = (0..N_PART)
+        .map(|_| (rng.random::<f64>() * L) as Real)
+        .collect();
+
+    let gpu = run_deposit_on_gpu(&x_host);
+    let cpu = cpu_get_density(&x_host);
+
+    let sum_gpu: f64 = gpu.iter().map(|&v| v as f64).sum::<f64>() * DX;
+    let sum_cpu: f64 = cpu.iter().map(|&v| v as f64).sum::<f64>() * DX;
+
+    let cons_rel = ((sum_gpu - sum_cpu) / sum_cpu).abs();
+    if cons_rel > 1e-10 {
+        eprintln!("deposit conservation mismatch: GPU sum*DX = {:.6e}, CPU sum*DX = {:.6e}, rel diff = {:.2e}",
+            sum_gpu, sum_cpu, cons_rel);
+        std::process::exit(1);
+    }
+
+    let max_cell = cpu.iter().fold(0.0 as Real, |a, &b| if b > a { b } else { a });
+    let tol_abs: Real = (max_cell * 1e-10) as Real;
+    let mut errors = 0;
+    let mut max_diff: Real = 0.0;
+    for i in 0..N_G {
+        let d = (gpu[i] - cpu[i]).abs();
+        if d > max_diff { max_diff = d; }
+        if d > tol_abs {
+            if errors < 5 {
+                eprintln!("deposit[{}]: GPU={:.6e} CPU={:.6e} diff={:.2e}", i, gpu[i], cpu[i], d);
+            }
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        println!("test_deposit_charge: {} cells exceed tol={:.2e}, max_diff={:.2e}",
+            errors, tol_abs, max_diff);
+        std::process::exit(1);
+    }
 }
