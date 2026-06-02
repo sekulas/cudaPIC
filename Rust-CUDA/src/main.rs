@@ -414,7 +414,7 @@ mod kernels {
         let mut k = tid;
         while k < N_G {
             let mut val = unsafe { LOCAL_DENSITY[k] };
-            if val != 0.0 as Real { // TODO - Nie potrzebne jak sortowanie??
+            if val != 0.0 as Real {
                 if k == 0 || k == N_G - 1 {
                     val *= 2.0 as Real;
                 }
