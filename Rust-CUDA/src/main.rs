@@ -10,6 +10,7 @@
 use cuda_core::{memory, CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{cuda_module, kernel, thread, DisjointSlice, SharedArray};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicF64, DeviceAtomicF64};
+use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
 use rand::RngExt;
 use rand_distr::Normal;
 use std::env;
@@ -98,6 +99,11 @@ const PRECOMPUTE_COLLISION_FREQ: bool = false;
 const FACTOR_E: f64 = DT_E / E_MASS * (-E_CHARGE);  // leapfrog acceleration factor for electrons [m/s per (V/m)]
 const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;    // leapfrog acceleration factor for ions [m/s per (V/m)]
 const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);
+
+// block must have ≥ N_G threads so each thread owns one grid point
+// Next multiple of 32 above N_G=400 is 416, but 512 is cleaner (2 warps of power-of-two).
+const SCAN_BLOCK_SIZE: u32   = 512;                             // 16 warps, covers N_G=400
+const SCAN_NUM_WARPS:  usize = SCAN_BLOCK_SIZE as usize / 32;   
 
 // SoA particle data - host-side representation
 
@@ -426,10 +432,207 @@ mod kernels {
         }
     }
 
-    // TODO: solve_poisson (parallel tridiagonal / prefix-sum solver / ...) // TODO - verify if there we can use f32 (no risks?)
+
+    // Double-Prefix-Sum Poisson solver - f32 only.
+    // Launch: 1 block, SCAN_BLOCK_SIZE=512 threads (≥ N_G=400).
+    #[kernel]
+    pub fn solve_poisson_scan_f32(
+        e_density:  &[f32],
+        i_density:  &[f32],
+        mut pot:    DisjointSlice<f32>,
+        mut efield: DisjointSlice<f32>,
+        pot0:       f32,
+    ) {
+        static mut SCAN_SMEM: SharedArray<f32, SCAN_NUM_WARPS> = SharedArray::UNINIT;
+        static mut H_S:       SharedArray<f32, N_G>            = SharedArray::UNINIT;
+        static mut POT_S:     SharedArray<f32, N_G>            = SharedArray::UNINIT;
+        static mut TOTAL_S:   SharedArray<f32, 1>              = SharedArray::UNINIT;
+
+        const ALPHA_F: f32            = (-DX * DX / EPSILON0) as f32;
+        const E_CHARGE_F:    f32      = E_CHARGE as f32;
+        const INV_DX_F: f32           = INV_DX as f32;
+        const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32;
+
+        let tid   = thread::threadIdx_x() as usize;
+        let block = this_thread_block();
+
+        let g_i: f32 = if tid == 0 || tid >= N_G {
+            0.0f32
+        } else {
+            let rho_i = E_CHARGE_F * (i_density[tid] - e_density[tid]);
+            let f_i   = ALPHA_F * rho_i - if tid == 1 { pot0 } else { 0.0f32 };
+            (tid as f32) * f_i
+        };
+
+        let s_i = block_scan::<f32, Sum, _>(&block, g_i, &raw mut SCAN_SMEM);
+
+        let h_i: f32 = if tid == 0 || tid >= N_G {
+            0.0f32
+        } else {
+            -s_i / (tid as f32 + 1.0f32)
+        };
+
+        if tid < N_G {
+            unsafe { H_S[tid] = h_i; }
+        }
+
+
+        thread::sync_threads();
+
+
+        let r_i: f32 = if tid == 0 || tid >= N_G - 1 {
+            0.0f32
+        } else {
+            unsafe { H_S[tid] / (tid as f32) }
+        };
+
+        let big_r_i = block_scan::<f32, Sum, _>(&block, r_i, &raw mut SCAN_SMEM);
+
+        if tid == N_G - 2 {
+            unsafe { TOTAL_S[0] = big_r_i; }
+        }
+
+
+        thread::sync_threads();
+        let total = unsafe { TOTAL_S[0] };
+
+
+        let pot_i: f32 = if tid == 0 {
+            pot0
+        } else if tid < N_G - 1 {
+            (tid as f32) * (total - big_r_i + r_i)
+        } else {
+            0.0f32 
+        };
+
+        if tid < N_G {
+            unsafe { POT_S[tid] = pot_i; }
+        }
+
+
+        thread::sync_threads();
+
+
+        // if tid < N_G {
+        //     let pk = unsafe { POT_S[tid] };
+        //     unsafe { *pot.get_unchecked_mut(tid) = pk; }
+
+        //     let e_i = if tid == 0 {
+        //         let rho0 = E_CHARGE_F * (i_density[0] - e_density[0]);
+        //         let pk1  = unsafe { POT_S[1] };
+        //         (pk - pk1) * INV_DX_F - rho0 * HALF_DX_OVER_EPS_F
+        //     } else if tid == N_G - 1 {
+        //         let rho_n = E_CHARGE_F * (i_density[N_G - 1] - e_density[N_G - 1]);
+        //         let pkm1  = unsafe { POT_S[N_G - 2] };
+        //         (pkm1 - pk) * INV_DX_F + rho_n * HALF_DX_OVER_EPS_F
+        //     } else {
+        //         let pkm1 = unsafe { POT_S[tid - 1] };
+        //         let pkp1 = unsafe { POT_S[tid + 1] };
+        //         0.5f32 * (pkm1 - pkp1) * INV_DX_F
+        //     };
+        //     unsafe { *efield.get_unchecked_mut(tid) = e_i; }
+        // }
+        if let Some((pot_elem, idx)) = pot.get_mut_indexed() {
+            let pk = unsafe { POT_S[tid] };
+            *pot_elem = pk;
+
+            let e_i = if tid == 0 {
+                let rho0 = E_CHARGE_F * (i_density[0] - e_density[0]);
+                let pk1  = unsafe { POT_S[1] };
+                (pk - pk1) * INV_DX_F - rho0 * HALF_DX_OVER_EPS_F
+            } else if tid == N_G - 1 {
+                let rho_n = E_CHARGE_F * (i_density[N_G - 1] - e_density[N_G - 1]);
+                let pkm1  = unsafe { POT_S[N_G - 2] };
+                (pkm1 - pk) * INV_DX_F + rho_n * HALF_DX_OVER_EPS_F
+            } else {
+                let pkm1 = unsafe { POT_S[tid - 1] };
+                let pkp1 = unsafe { POT_S[tid + 1] };
+                0.5f32 * (pkm1 - pkp1) * INV_DX_F
+            };
+
+            if let Some(efield_elem) = efield.get_mut(idx) {
+                *efield_elem = e_i;
+            }
+        }
+    }
+
     // TODO: check_boundaries (stream compaction / ...)
     // TODO: collisions_e (electron-neutral MCC, ionization appends directly / ...)
     // TODO: collisions_i (ion-neutral MCC / ...)
+
+    /// testing: flexible Double-Prefix-Sum Poisson solver for convergence testing
+    /// solves ψ[i-1] - 2ψ[i] + ψ[i+1] = f[i] where f[i] = dx²·source[i].
+    /// outputs only potential (no E-field) since convergence test needs only ψ.
+    #[kernel]
+    pub fn solve_poisson_dps_flexible(
+        source:    &[f32],              // source term s(x_i), length = n
+        mut pot:   DisjointSlice<f32>,  // output potential, length = n
+        n:         u32,                 // number of grid points (including boundaries)
+        psi_left:  f32,                 // ψ(0) boundary condition
+        psi_right: f32,                 // ψ(N-1) boundary condition
+        dx:        f32,                 // grid spacing
+    ) {
+        static mut SCAN_SMEM: SharedArray<f32, DPS_TEST_WARPS>   = SharedArray::UNINIT;
+        static mut H_S:       SharedArray<f32, DPS_TEST_MAX_N>   = SharedArray::UNINIT;
+        static mut TOTAL_S:   SharedArray<f32, 1>                = SharedArray::UNINIT;
+
+        let tid   = thread::threadIdx_x() as usize;
+        let nn    = n as usize;
+        let block = this_thread_block();
+        let dx2   = dx * dx;
+
+        let g_i: f32 = if tid == 0 || tid >= nn {
+            0.0f32
+        } else {
+            let mut f_i = dx2 * source[tid];
+            if tid == 1        { f_i -= psi_left; }
+            if tid == nn - 2   { f_i -= psi_right; }
+            (tid as f32) * f_i
+        };
+
+        let s_i = block_scan::<f32, Sum, _>(&block, g_i, &raw mut SCAN_SMEM);
+
+        let h_i: f32 = if tid == 0 || tid >= nn {
+            0.0f32
+        } else {
+            -s_i / (tid as f32 + 1.0f32)
+        };
+
+        if tid < nn {
+            unsafe { H_S[tid] = h_i; }
+        }
+        thread::sync_threads();
+
+        let r_i: f32 = if tid == 0 || tid >= nn - 1 {
+            0.0f32
+        } else {
+            unsafe { H_S[tid] / (tid as f32) }
+        };
+
+        let big_r_i = block_scan::<f32, Sum, _>(&block, r_i, &raw mut SCAN_SMEM);
+
+        if tid == nn - 2 {
+            unsafe { TOTAL_S[0] = big_r_i; }
+        }
+        thread::sync_threads();
+        let total = unsafe { TOTAL_S[0] };
+
+        let pot_i: f32 = if tid == 0 {
+            psi_left
+        } else if tid < nn - 1 {
+            (tid as f32) * (total - big_r_i + r_i)
+        } else if tid == nn - 1 {
+            psi_right
+        } else {
+            0.0f32
+        };
+
+        if let Some((pot_elem, _idx)) = pot.get_mut_indexed() {
+            if tid < nn {
+                *pot_elem = pot_i;
+            }
+        }
+    }
 }
 
 // Host-side initialization helpers
@@ -651,6 +854,8 @@ fn perform_tests() {
     test_move_particles_analytic();
     test_move_particles_edge_cases();
     test_move_particles();
+    test_dps_convergence();
+    test_dps_convergence_gpu();
     bench_shmem_vs_no_shmem();
     test_deposit_charge_analytic();
     test_deposit_charge();
@@ -988,4 +1193,230 @@ fn test_deposit_charge() {
             errors, tol_abs, max_diff);
         std::process::exit(1);
     }
+}
+
+// =====================
+// Poisson solver tests
+// =====================
+
+// Flexible DPS test kernel: supports up to 512 grid points (N=8..400).
+const DPS_TEST_BLOCK: u32    = 512;
+const DPS_TEST_WARPS: usize  = DPS_TEST_BLOCK as usize / 32;    // = 16
+const DPS_TEST_MAX_N: usize  = 512;
+
+/// Generic CPU Double-Prefix-Sum solver for ψ''(x) = s(x) on [0,1]
+/// with Dirichlet BCs ψ(0)=psi_left, ψ(N-1)=psi_right.
+///
+/// Discretization: ψ[i-1] - 2ψ[i] + ψ[i+1] = dx² · s(x_i)
+/// for interior nodes i=1..N-2.
+///
+/// This is the same algorithm as the GPU kernel `solve_poisson_scan_f32`,
+/// parametrized by grid size N instead of the fixed N_G=400.
+fn solve_poisson_dps_generic(n: usize, source: &[f64], psi_left: f64, psi_right: f64) -> Vec<f64> {
+    let dx = 1.0 / (n - 1) as f64;
+
+    let mut f = vec![0.0f64; n];
+    for i in 1..=(n - 2) {
+        f[i] = dx * dx * source[i];
+    }
+    f[1]     -= psi_left;
+    f[n - 2] -= psi_right;
+
+    let mut g = vec![0.0f64; n];
+    for i in 1..n {
+        g[i] = (i as f64) * f[i];
+    }
+    let mut s = vec![0.0f64; n];
+    for i in 1..n {
+        s[i] = s[i - 1] + g[i];
+    }
+
+    let mut h = vec![0.0f64; n];
+    for i in 1..(n - 1) {
+        h[i] = -s[i] / (i as f64 + 1.0);
+    }
+
+    let mut r = vec![0.0f64; n];
+    for i in 1..(n - 1) {
+        r[i] = h[i] / (i as f64);
+    }
+    let mut big_r = vec![0.0f64; n];
+    for i in 1..n {
+        big_r[i] = big_r[i - 1] + r[i];
+    }
+    let total = big_r[n - 2];
+
+    let mut psi = vec![0.0f64; n];
+    psi[0]     = psi_left;
+    psi[n - 1] = psi_right;
+    for i in 1..(n - 1) {
+        psi[i] = (i as f64) * (total - big_r[i] + r[i]);
+    }
+    psi
+}
+
+// Convergence test for Double-Prefix-Sum Poisson solver.
+// (https://ammar-hakim.org/sj/je/je11/je11-fem-poisson.html#convergence-of-1d-solver) 
+//
+// Problem: ψ''(x) = 1 - 2x² on [0,1], ψ(0)=ψ(1)=0
+// Exact:   ψ(x) = x²/2 - x⁴/6 - x/3
+//
+// Expected: second-order convergence (error ∝ dx²), order → 2.0.
+// Writes results to `results/dps_cpu_N{n}.csv`.
+fn test_dps_convergence() {
+    use std::fs;
+    use std::io::Write;
+
+    let a: f64 = 2.0;
+    let source_fn = |x: f64| -> f64 { 1.0 - a * x * x };
+    let exact_fn  = |x: f64| -> f64 { x * x / 2.0 - x.powi(4) / 6.0 - x / 3.0 };
+
+    let grid_sizes: &[usize] = &[8, 16, 32, 64, 100, 200, 400];
+    let mut errors: Vec<f64> = Vec::new();
+    let mut dxs: Vec<f64> = Vec::new();
+
+    fs::create_dir_all("results").unwrap();
+
+    println!(">> test_dps_convergence: ψ''(x) = 1 - 2x², ψ(0)=ψ(1)=0");
+    println!("   {:>4}  {:>12}  {:>12}  {:>8}", "N", "dx", "avg_error", "order");
+
+    for &n in grid_sizes {
+        let dx = 1.0 / (n - 1) as f64;
+        dxs.push(dx);
+
+        let source: Vec<f64> = (0..n).map(|i| source_fn(i as f64 * dx)).collect();
+        let psi_num = solve_poisson_dps_generic(n, &source, 0.0, 0.0);
+
+        let mut file = fs::File::create(format!("results/dps_cpu_N{}.csv", n)).unwrap();
+        writeln!(file, "x,psi_num,psi_exact").unwrap();
+        for i in 0..n {
+            let x = i as f64 * dx;
+            writeln!(file, "{:.15e},{:.15e},{:.15e}", x, psi_num[i], exact_fn(x)).unwrap();
+        }
+
+        let mut err_sum = 0.0f64;
+        let mut count = 0usize;
+        for i in 1..(n - 1) {
+            let x = i as f64 * dx;
+            err_sum += (psi_num[i] - exact_fn(x)).abs();
+            count += 1;
+        }
+        let avg_err = err_sum / count as f64;
+        errors.push(avg_err);
+
+        let order = if errors.len() >= 2 {
+            (errors[errors.len() - 2] / errors[errors.len() - 1]).ln()
+                / (dxs[dxs.len() - 2] / dxs[dxs.len() - 1]).ln()
+        } else { 0.0 };
+
+        if errors.len() >= 2 {
+            println!("   {:>4}  {:>12.6e}  {:>12.6e}  {:>8.4}", n, dx, avg_err, order);
+        } else {
+            println!("   {:>4}  {:>12.6e}  {:>12.6e}  {:>8}", n, dx, avg_err, "---");
+        }
+    }
+
+    let final_order = (errors[errors.len() - 2] / errors[errors.len() - 1]).ln()
+        / (dxs[dxs.len() - 2] / dxs[dxs.len() - 1]).ln();
+
+    let mut test_errors = 0;
+    for i in 1..errors.len() {
+        if errors[i] >= errors[i - 1] { test_errors += 1; }
+    }
+    if final_order < 1.8 { test_errors += 1; }
+    if errors[errors.len() - 1] > 1e-4 { test_errors += 1; }
+
+    if test_errors > 0 {
+        println!("test_dps_convergence: FAILED ({} assertions)", test_errors);
+        std::process::exit(1);
+    }
+    println!("   → PASSED (order={:.4}), files written to results/dps_cpu_N*.csv", final_order);
+}
+
+// GPU convergence test — writes results to `results/dps_gpu_N{n}.csv`.
+fn test_dps_convergence_gpu() {
+    use std::fs;
+    use std::io::Write;
+
+    let a: f64 = 2.0;
+    let source_fn = |x: f64| -> f64 { 1.0 - a * x * x };
+    let exact_fn  = |x: f64| -> f64 { x * x / 2.0 - x.powi(4) / 6.0 - x / 3.0 };
+
+    let ctx    = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let module = kernels::load(&ctx).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (DPS_TEST_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let grid_sizes: &[usize] = &[8, 16, 32, 64, 100, 200, 400];
+    let mut errors: Vec<f64> = Vec::new();
+    let mut dxs: Vec<f64> = Vec::new();
+
+    fs::create_dir_all("results").unwrap();
+
+    println!(">> test_dps_convergence_gpu: ψ''(x) = 1 - 2x², ψ(0)=ψ(1)=0  [GPU kernel f32]");
+    println!("   {:>4}  {:>12}  {:>12}  {:>8}", "N", "dx", "avg_error", "order");
+
+    for &n in grid_sizes {
+        let dx = 1.0 / (n - 1) as f64;
+        dxs.push(dx);
+
+        let source_f32: Vec<f32> = (0..n).map(|i| source_fn(i as f64 * dx) as f32).collect();
+        let source_dev = DeviceBuffer::from_host(&stream, &source_f32).unwrap();
+        let mut pot_dev = DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
+
+        module.solve_poisson_dps_flexible(
+            &stream, cfg,
+            &source_dev, &mut pot_dev,
+            n as u32, 0.0f32, 0.0f32, dx as f32,
+        ).unwrap();
+
+        let pot_gpu = pot_dev.to_host_vec(&stream).unwrap();
+
+        let mut file = fs::File::create(format!("results/dps_gpu_N{}.csv", n)).unwrap();
+        writeln!(file, "x,psi_num,psi_exact").unwrap();
+        for i in 0..n {
+            let x = i as f64 * dx;
+            writeln!(file, "{:.15e},{:.15e},{:.15e}", x, pot_gpu[i] as f64, exact_fn(x)).unwrap();
+        }
+
+        let mut err_sum = 0.0f64;
+        for i in 1..(n - 1) {
+            let x = i as f64 * dx;
+            err_sum += (pot_gpu[i] as f64 - exact_fn(x)).abs();
+        }
+        let avg_err = err_sum / (n - 2) as f64;
+        errors.push(avg_err);
+
+        let order = if errors.len() >= 2 {
+            (errors[errors.len() - 2] / errors[errors.len() - 1]).ln()
+                / (dxs[dxs.len() - 2] / dxs[dxs.len() - 1]).ln()
+        } else { 0.0 };
+
+        if errors.len() >= 2 {
+            println!("   {:>4}  {:>12.6e}  {:>12.6e}  {:>8.4}", n, dx, avg_err, order);
+        } else {
+            println!("   {:>4}  {:>12.6e}  {:>12.6e}  {:>8}", n, dx, avg_err, "---");
+        }
+    }
+
+    let final_order = (errors[errors.len() - 2] / errors[errors.len() - 1]).ln()
+        / (dxs[dxs.len() - 2] / dxs[dxs.len() - 1]).ln();
+
+    let mut test_errors = 0;
+    for i in 1..errors.len() {
+        if errors[i] >= errors[i - 1] { test_errors += 1; }
+    }
+    if final_order < 1.8 { test_errors += 1; }
+    if errors[errors.len() - 1] > 1e-4 { test_errors += 1; }
+
+    if test_errors > 0 {
+        println!("test_dps_convergence_gpu: FAILED ({} assertions)", test_errors);
+        std::process::exit(1);
+    }
+    println!("   → PASSED (order={:.4}), files written to results/dps_gpu_N*.csv", final_order);
 }
