@@ -920,6 +920,8 @@ fn perform_tests() {
     bench_shmem_vs_no_shmem();
     test_deposit_charge_analytic();
     test_deposit_charge();
+    test_check_boundaries_unit();
+    test_check_boundaries_many_blocks();
 }
 
 // expected result is computable without oracle
@@ -1252,6 +1254,154 @@ fn test_deposit_charge() {
     if errors > 0 {
         println!("test_deposit_charge: {} cells exceed tol={:.2e}, max_diff={:.2e}",
             errors, tol_abs, max_diff);
+        std::process::exit(1);
+    }
+}
+
+// =========================
+// check_boundaries tests
+// =========================
+
+// run check_boundaries_compact on the GPU.
+// returns: (dst_x, dst_vx, dst_vy, dst_vz, n_alive).
+// only the first `n_alive` entries of the dst vectors are valid survivors.
+fn run_check_boundaries(
+    x: &[Real], vx: &[Real], vy: &[Real], vz: &[Real],
+) -> (Vec<Real>, Vec<Real>, Vec<Real>, Vec<Real>, u32) {
+    let n = x.len();
+
+    let ctx    = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+    let module = kernels::load(&ctx).unwrap();
+
+    let src_x  = DeviceBuffer::from_host(&stream, x).unwrap();
+    let src_vx = DeviceBuffer::from_host(&stream, vx).unwrap();
+    let src_vy = DeviceBuffer::from_host(&stream, vy).unwrap();
+    let src_vz = DeviceBuffer::from_host(&stream, vz).unwrap();
+
+    let mut dst_x  = DeviceBuffer::<Real>::zeroed(&stream, n).unwrap();
+    let mut dst_vx = DeviceBuffer::<Real>::zeroed(&stream, n).unwrap();
+    let mut dst_vy = DeviceBuffer::<Real>::zeroed(&stream, n).unwrap();
+    let mut dst_vz = DeviceBuffer::<Real>::zeroed(&stream, n).unwrap();
+
+    let alive   = DeviceBuffer::from_host(&stream, &[0u32]).unwrap();
+
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    module.check_boundaries_compact(
+        &stream, cfg,
+        &src_x, &src_vx, &src_vy, &src_vz,
+        &mut dst_x, &mut dst_vx, &mut dst_vy, &mut dst_vz,
+        &alive, n as u32,
+    ).unwrap();
+
+    let n_alive = alive.to_host_vec(&stream).unwrap()[0];
+
+    let dx  = dst_x.to_host_vec(&stream).unwrap();
+    let dvx = dst_vx.to_host_vec(&stream).unwrap();
+    let dvy = dst_vy.to_host_vec(&stream).unwrap();
+    let dvz = dst_vz.to_host_vec(&stream).unwrap();
+
+    (dx, dvx, dvy, dvz, n_alive)
+}
+
+fn test_check_boundaries_unit() {
+    //                  idx:  0     1   2     3   4   5     6   7   8   9
+    // fate:                  pow   ok  gnd   ok  ok  pow   ok  gnd ok  gnd
+    let x: Vec<Real> = vec![
+        -1.0e-3,                 // 0: x < 0           -> abs_pow
+        0.5 * L as Real,         // 1: inside          -> alive
+        L as Real + 1.0e-3,      // 2: x > L           -> abs_gnd
+        0.0,                     // 3: x == 0 (edge)   -> alive
+        0.25 * L as Real,        // 4: inside          -> alive
+        -5.0e-4,                 // 5: x < 0           -> abs_pow
+        L as Real,               // 6: x == L (edge)   -> alive
+        2.0 * L as Real,         // 7: x > L           -> abs_gnd
+        0.75 * L as Real,        // 8: inside          -> alive
+        L as Real + 5.0e-3,      // 9: x > L           -> abs_gnd
+    ];
+
+    // unique velocity signatures so survivor data can be verified exactly.
+    let vx: Vec<Real> = (0..x.len()).map(|i| (i as Real + 1.0) * 10.0).collect();
+    let vy: Vec<Real> = (0..x.len()).map(|i| (i as Real + 1.0) * 100.0).collect();
+    let vz: Vec<Real> = (0..x.len()).map(|i| (i as Real + 1.0) * 1000.0).collect();
+
+    let (dx, dvx, dvy, dvz, n_alive) = run_check_boundaries(&x, &vx, &vy, &vz);
+
+    let mut errors = 0;
+    if n_alive != 5 { 
+        eprintln!("unit alive: got {} expected 5", n_alive); 
+        errors += 1; 
+    }
+
+    let mut got: Vec<(Real, Real, Real, Real)> =
+        (0..n_alive as usize).map(|i| (dx[i], dvx[i], dvy[i], dvz[i])).collect();
+    let mut expected: Vec<(Real, Real, Real, Real)> =
+        [1usize, 3, 4, 6, 8].iter().map(|&i| (x[i], vx[i], vy[i], vz[i])).collect();
+    got.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    if got.len() == expected.len() {
+        for (g, e) in got.iter().zip(expected.iter()) {
+            if g != e {
+                eprintln!("unit survivor mismatch: got {:?} expected {:?}", g, e);
+                errors += 1;
+            }
+        }
+    }
+    if errors > 0 {
+        println!("test_check_boundaries_unit: {} errors", errors);
+        std::process::exit(1);
+    }
+}
+
+fn test_check_boundaries_many_blocks() {
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    const N: usize = 100_000;
+    let mut rng = StdRng::seed_from_u64(0xB0DEu64);
+
+    // positions in [-0.1 L, 1.1 L] -> ~1/12 absorbed at each electrode
+    let x: Vec<Real> = (0..N)
+        .map(|_| ((rng.random::<f64>() * 1.2 - 0.1) * L) as Real)
+        .collect();
+
+    // unique per-particle velocity keys
+    let vx: Vec<Real> = (0..N).map(|i| i as Real).collect();
+    let vy: Vec<Real> = (0..N).map(|i| (i as Real) * 2.0).collect();
+    let vz: Vec<Real> = (0..N).map(|i| (i as Real) * 3.0).collect();
+
+    // CPU reference
+    let mut ref_alive: Vec<(Real, Real, Real, Real)> = Vec::new();
+    for i in 0..N {
+        if x[i] >= 0.0 as Real && x[i] <= L as Real {
+            ref_alive.push((x[i], vx[i], vy[i], vz[i]));
+        }
+    }
+
+    let (dx, dvx, dvy, dvz, n_alive) = run_check_boundaries(&x, &vx, &vy, &vz);
+
+    let mut errors = 0;
+    if n_alive as usize != ref_alive.len() {
+        eprintln!("alive: got {} expected {}", n_alive, ref_alive.len());
+        errors += 1;
+    }
+
+    let mut got: Vec<(Real, Real, Real, Real)> =
+        (0..n_alive as usize).map(|i| (dx[i], dvx[i], dvy[i], dvz[i])).collect();
+    got.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+    if got.len() == ref_alive.len() {
+        for (g, e) in got.iter().zip(ref_alive.iter()) {
+            if g != e {
+                if errors < 5 {
+                    eprintln!("survivor mismatch: got {:?} expected {:?}", g, e);
+                }
+                errors += 1;
+            }
+        }
+    }
+    if errors > 0 {
+        println!("test_check_boundaries: {} errors", errors);
         std::process::exit(1);
     }
 }
