@@ -9,7 +9,7 @@
 
 use cuda_core::{memory, CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{cuda_module, kernel, thread, DisjointSlice, SharedArray};
-use cuda_device::atomic::{AtomicOrdering, BlockAtomicF64, DeviceAtomicF64};
+use cuda_device::atomic::{AtomicOrdering, BlockAtomicF64, DeviceAtomicF64, DeviceAtomicU32};
 use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
 use rand::RngExt;
 use rand_distr::Normal;
@@ -104,6 +104,11 @@ const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);
 // Next multiple of 32 above N_G=400 is 416, but 512 is cleaner (2 warps of power-of-two).
 const SCAN_BLOCK_SIZE: u32   = 512;                             // 16 warps, covers N_G=400
 const SCAN_NUM_WARPS:  usize = SCAN_BLOCK_SIZE as usize / 32;   
+
+// check_boundaries stream compaction: per-block prefix scan + 1 atomicAdd/block.
+// Block size is fixed at 256 (8 warps) to match LaunchConfig::for_num_elems. TODO - verify
+const COMPACT_BLOCK_SIZE: u32   = 256;
+const COMPACT_NUM_WARPS:  usize = COMPACT_BLOCK_SIZE as usize / 32;   // = 8
 
 // SoA particle data - host-side representation
 
@@ -556,7 +561,63 @@ mod kernels {
         }
     }
 
-    // TODO: check_boundaries (stream compaction / ...)
+    // per-block inclusive prefix scan over an
+    // alive/dead flag (`block_scan`, fully parallel within a block in O(log N)
+    // steps), plus a single `atomicAdd` per block to reserve a contiguous slot
+    // range in the destination buffer. Each survivor writes to its globally unique
+    // slot `base + inclusive - 1`.
+    #[kernel]
+    pub fn check_boundaries_compact(
+        src_x:  &[Real],
+        src_vx: &[Real],
+        src_vy: &[Real],
+        src_vz: &[Real],
+        mut dst_x:  DisjointSlice<Real>,
+        mut dst_vx: DisjointSlice<Real>,
+        mut dst_vy: DisjointSlice<Real>,
+        mut dst_vz: DisjointSlice<Real>,
+        alive_counter: &[u32],   // global alive count (MUST BE zeroed before launch)
+        n_active:      u32,
+    ) {
+        static mut SCAN_SMEM: SharedArray<u32, COMPACT_NUM_WARPS> = SharedArray::UNINIT;
+        static mut BASE_S:    SharedArray<u32, 1>                 = SharedArray::UNINIT;
+
+        let block = this_thread_block();
+        let tid   = thread::threadIdx_x() as usize;
+        let bdim  = thread::blockDim_x()  as usize;
+        let i     = thread::index_1d().get();
+
+        let mut flag: u32 = 0;
+        if i < n_active as usize {
+            let xi = src_x[i];
+            if xi >= 0.0 as Real && xi <= L as Real {
+                flag = 1;
+            }
+        }
+
+        let incl = block_scan::<u32, Sum, _>(&block, flag, &raw mut SCAN_SMEM);
+
+        if tid == bdim - 1 {
+            let g    = unsafe { DeviceAtomicU32::from_ptr(alive_counter.as_ptr() as *mut u32) };
+            let base = g.fetch_add(incl, AtomicOrdering::Relaxed);
+            unsafe { BASE_S[0] = base; }
+        }
+
+        thread::sync_threads();
+
+        // each SURVIVING thread owns a distinct `slot`: prefix scan + per-block base
+        if flag == 1 {
+            let base = unsafe { BASE_S[0] };
+            let slot = base as usize + incl as usize - 1; // inclusive scan -> subtract self
+            unsafe {
+                *dst_x.get_unchecked_mut(slot)  = src_x[i];
+                *dst_vx.get_unchecked_mut(slot) = src_vx[i];
+                *dst_vy.get_unchecked_mut(slot) = src_vy[i];
+                *dst_vz.get_unchecked_mut(slot) = src_vz[i];
+            }
+        }
+    }
+
     // TODO: collisions_e (electron-neutral MCC, ionization appends directly / ...)
     // TODO: collisions_i (ion-neutral MCC / ...)
 
