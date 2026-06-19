@@ -86,7 +86,6 @@ const MAX_PARTICLES_U32: u32 = MAX_PARTICLES as u32; // used for LaunchConfig::f
 const N_SPECIES: usize        = 2;                    // electrons + ions
 const PARTICLE_COMPS: usize   = 4;                    // arrays per species: x, vx, vy, vz
 const N_GRID_ARRAYS: usize    = 5;                    // efield, pot, rho, e_density, i_density
-const RNG_STATE_COMPS: usize  = 4;                    // xoshiro256** state: 4 × u64 per particle
 const SIZEOF_REAL: usize      = std::mem::size_of::<Real>();  // adapts to Real precision
 const BYTES_PER_MB: f64       = 1_048_576.0;          // 1024 × 1024
 
@@ -174,8 +173,14 @@ struct GpuSimState {
     sigma_tot_i: DeviceBuffer<Real>,  // [CS_RANGES]
 
     // RNG state per-particle
-    // flattened: rng_state[particle_idx * 4 + component]
-    rng_state: DeviceBuffer<u64>,
+    rng_e0: DeviceBuffer<u32>,
+    rng_e1: DeviceBuffer<u32>,
+    rng_e2: DeviceBuffer<u32>,
+    rng_e3: DeviceBuffer<u32>,
+    rng_i0: DeviceBuffer<u32>,
+    rng_i1: DeviceBuffer<u32>,
+    rng_i2: DeviceBuffer<u32>,
+    rng_i3: DeviceBuffer<u32>,
 }
 
 impl GpuSimState {
@@ -211,10 +216,16 @@ impl GpuSimState {
             sigma_tot_e: DeviceBuffer::<Real>::zeroed(stream, CS_RANGES)?,
             sigma_tot_i: DeviceBuffer::<Real>::zeroed(stream, CS_RANGES)?,
 
-            // RNG state: 4 × u64 per particle
-            // TODO xoshiro256** - verify
-            rng_state: DeviceBuffer::<u64>::zeroed(stream, MAX_PARTICLES * 4)?,
-        })
+            // RNG state: 4 × u32 per particle
+            // TODO xoshiro128+ - verify
+            rng_e0: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
+            rng_e1: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
+            rng_e2: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
+            rng_e3: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
+            rng_i0: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
+            rng_i1: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
+            rng_i2: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
+            rng_i3: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,        })
     }
 
     // upload initial particle data from host.
@@ -267,9 +278,22 @@ impl GpuSimState {
     fn upload_rng_state(
         &mut self,
         stream: &cuda_core::CudaStream,
-        seeds: &[u64],
+        e_seeds: &[[u32; 4]],
+        i_seeds: &[[u32; 4]],
     ) -> Result<(), cuda_core::DriverError> {
-        self.rng_state = DeviceBuffer::from_host(stream, seeds)?;
+        fn split(src: &[[u32; 4]]) -> [Vec<u32>; 4] {
+            core::array::from_fn(|k| src.iter().map(|s| s[k]).collect())
+        }
+        let [s0, s1, s2, s3] = split(e_seeds);
+        self.rng_e0 = DeviceBuffer::from_host(stream, &s0)?;
+        self.rng_e1 = DeviceBuffer::from_host(stream, &s1)?;
+        self.rng_e2 = DeviceBuffer::from_host(stream, &s2)?;
+        self.rng_e3 = DeviceBuffer::from_host(stream, &s3)?;
+        let [s0, s1, s2, s3] = split(i_seeds);
+        self.rng_i0 = DeviceBuffer::from_host(stream, &s0)?;
+        self.rng_i1 = DeviceBuffer::from_host(stream, &s1)?;
+        self.rng_i2 = DeviceBuffer::from_host(stream, &s2)?;
+        self.rng_i3 = DeviceBuffer::from_host(stream, &s3)?;
         Ok(())
     }
 
@@ -787,22 +811,54 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
     (cs_flat, sigma_tot_e, sigma_tot_i)
 }
 
-/// generate xoshiro256** seed state for all particle slots.
-/// each particle gets 4 × u64 seeded from a master RNG.
-fn generate_rng_seeds(n: usize) -> Vec<u64> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// generate xoshiro128+ seed state for all particle slots.
+fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
+    debug_assert!(master_seed != [0, 0, 0, 0], "state should not be everywhere 0");
 
-    let mut seeds = vec![0u64; n * 4];
-    for i in 0..n {
-        for j in 0..4 {
-            let mut hasher = DefaultHasher::new();
-            (i as u64 * 4 + j as u64).hash(&mut hasher);
-            seeds[i * 4 + j] = hasher.finish() | 1;       // ensure non-zero state (xoshiro requirement)
-        }
+    const JUMP: [u32; 4] = [0x8764000b, 0xf542d2d3, 0x6fa035c3, 0x77f2db5b];
+
+    fn rotl32(x: u32, k: u32) -> u32 { (x << k) | (x >> (32 - k)) }
+    fn next(s: &mut [u32; 4]) -> u32 {
+        let result = s[0] + s[3];
+
+        let t = s[1] << 9;
+
+        s[2] ^= s[0]; 
+        s[3] ^= s[1];
+        s[1] ^= s[2]; 
+        s[0] ^= s[3];
+
+        s[2] ^= t;    
+        
+        s[3] = rotl32(s[3], 11);
+
+        result
     }
-    seeds
+    fn jump(s: &mut [u32; 4]) {
+        let mut acc = [0u32; 4];
+        for &word in JUMP.iter() {
+            for b in 0..32 {
+                if word & (1u32 << b) != 0 {
+                    acc[0] ^= s[0];
+                    acc[1] ^= s[1];
+                    acc[2] ^= s[2];
+                    acc[3] ^= s[3];
+                }
+                next(s);
+            }
+        }
+        *s = acc;
+    }
+
+    let mut state = master_seed;
+    let mut streams = Vec::with_capacity(n);
+    for _ in 0..n {
+        streams.push(state);
+        jump(&mut state);
+    }
+    streams
 }
+
 
 fn main() {
     perform_tests();
@@ -840,7 +896,7 @@ fn main() {
         + N_CS * CS_RANGES * SIZEOF_REAL                            // cross sections
         + CS_RANGES * SIZEOF_REAL * N_SPECIES                       // sigma_tot_e + sigma_tot_i
         + N_G * N_GRID_ARRAYS * SIZEOF_REAL                         // grid arrays
-        + MAX_PARTICLES * RNG_STATE_COMPS * 8                       // RNG state (always u64)
+        + MAX_PARTICLES * 4 * 2                                       // RNG state (always u32)
         ) as f64 / BYTES_PER_MB
     );
 
@@ -852,8 +908,9 @@ fn main() {
     gpu.upload_cross_sections(&stream, &cs_flat, &sigma_tot_e, &sigma_tot_i)
         .expect("Failed to upload cross-sections");
 
-    let rng_seeds = generate_rng_seeds(MAX_PARTICLES);
-    gpu.upload_rng_state(&stream, &rng_seeds)
+    let e_seeds = xoshiro128_seed_streams([0x1234_5678, 0x1111_2222, 0x2222_3333, 0x3333_4444], MAX_PARTICLES as usize);
+    let i_seeds = xoshiro128_seed_streams([0x4444_5555, 0x5555_6666, 0x6666_7777, 0x7777_8888], MAX_PARTICLES as usize);
+    gpu.upload_rng_state(&stream, &e_seeds, &i_seeds)
         .expect("Failed to upload RNG state");
 
     println!(">> eduPIC-GPU: data uploaded to GPU");
