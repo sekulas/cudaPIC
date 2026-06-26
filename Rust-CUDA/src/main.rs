@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use cuda_core::{memory, CudaContext, DeviceBuffer, LaunchConfig};
-use cuda_device::{cuda_module, kernel, thread, DisjointSlice, SharedArray};
+use cuda_device::{cuda_module, kernel, thread, ptx_asm, DisjointSlice, SharedArray};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicF64, DeviceAtomicF64, DeviceAtomicU32};
 use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
 use rand::RngExt;
@@ -113,6 +113,7 @@ const COMPACT_NUM_WARPS:  usize = COMPACT_BLOCK_SIZE as usize / 32;   // = 8
 const NORMAL_RANGE: Real = 269.90040554976775; // (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt();  // thermal velocity of background gas [m/s]
 const F1: Real = E_MASS / (E_MASS + AR_MASS);
 const F2: Real = AR_MASS / (E_MASS + AR_MASS);
+const LOG2_E: Real = 1.4426950408889634; // log2(e)
 
 // SoA particle data - host-side representation
 
@@ -724,8 +725,170 @@ mod kernels {
         }
     }
 
-    fn tan(x: Real) -> Real {
-        x.sin() / x.cos()
+    #[inline(always)]                                                                                                                                                                
+    fn ptx_abs(x: Real) -> Real {                                                                                                                                                    
+        let result: Real;
+        unsafe {
+            ptx_asm!(
+                "abs.f32 %0, %1;",
+                out("=f") result,
+                in("f") x,
+                options(register_only),
+            );
+        }
+        result
+    }
+
+
+    #[inline(always)]
+    fn ptx_sqrt(x: Real) -> Real {
+        let result: Real;
+        unsafe {
+            ptx_asm!(
+                "sqrt.approx.f32 %0, %1;",
+                out("=f") result,
+                in("f") x,
+                options(register_only),
+            );
+        }
+        result
+    }
+
+    #[inline(always)]
+    fn ptx_sin(x: Real) -> Real {
+        let result: Real;
+        unsafe {
+            ptx_asm!(
+                "sin.approx.f32 %0, %1;",
+                out("=f") result,
+                in("f") x,
+                options(register_only),
+            );
+        }
+        result
+    }
+
+    #[inline(always)]
+    fn ptx_cos(x: Real) -> Real {
+        let result: Real;
+        unsafe {
+            ptx_asm!(
+                "cos.approx.f32 %0, %1;",
+                out("=f") result,
+                in("f") x,
+                options(register_only),
+            );
+        }
+        result
+    }
+
+    /// 2^x
+    #[inline(always)]
+    fn ptx_ex2(x: Real) -> Real {
+        let result: Real;
+        unsafe {
+            ptx_asm!(
+                "ex2.approx.f32 %0, %1;",
+                out("=f") result,
+                in("f") x,
+                options(register_only),
+            );
+        }
+        result
+    }
+
+    /// log2(x)
+    #[inline(always)]
+    fn ptx_lg2(x: Real) -> Real {
+        let result: Real;
+        unsafe {
+            ptx_asm!(
+                "lg2.approx.f32 %0, %1;",
+                out("=f") result,
+                in("f") x,
+                options(register_only),
+            );
+        }
+        result
+    }
+
+    /// 1/x
+    #[inline(always)]
+    fn ptx_rcp(x: Real) -> Real {
+        let result: Real;
+        unsafe {
+            ptx_asm!(
+                "rcp.approx.f32 %0, %1;",
+                out("=f") result,
+                in("f") x,
+                options(register_only),
+            );
+        }
+        result
+    }
+
+    /// 2^(x * log2(e))
+    #[inline(always)]
+    fn ptx_exp(x: Real) -> Real {
+        ptx_ex2(x * LOG2_E)
+    }
+
+    /// sin(x) / cos(x)
+    #[inline(always)]
+    fn ptx_tan(x: Real) -> Real {
+        let s = ptx_sin(x);
+        let c = ptx_cos(x);
+        s * ptx_rcp(c)
+    }
+
+    /// for |x| > 1, atan(x) = pi/2 - atan(1/x)
+    #[inline(always)]
+    fn ptx_atan(x: Real) -> Real {
+        let ax = if x < 0.0 { -x } else { x };
+        let swap = ax > 1.0;
+        let z = if swap { ptx_rcp(ax) } else { ax };
+
+        let z2 = z * z;
+        let mut r = -0.0464964749;
+        r = r * z2 + 0.15931422;
+        r = r * z2 - 0.327622764;
+        r = r * z2 + 0.999847695;
+        r = r * z;
+
+        if swap {
+            r = (0.5 * PI as Real) - r;
+        }
+        if x < 0.0 { -r } else { r }
+    }
+
+    #[inline(always)]
+    fn ptx_atan2(y: Real, x: Real) -> Real {
+        let ax = if x < 0.0 { -x } else { x };
+        let ay = if y < 0.0 { -y } else { y };
+
+        if ax < 1e-30 && ay < 1e-30 {
+            return 0.0;
+        }
+
+        let a: Real;
+        let swap = ay > ax;
+        if swap {
+            a = ptx_atan(ax * ptx_rcp(ay));
+        } else {
+            a = ptx_atan(ay * ptx_rcp(ax));
+        }
+
+        let r = if swap { (0.5 * PI as Real) - a } else { a };
+        let r = if x < 0.0 { PI as Real - r } else { r };
+        if y < 0.0 { -r } else { r }
+    }
+
+    /// atan2(sqrt(1 - x*x), x)
+    #[inline(always)]
+    fn ptx_acos(x: Real) -> Real {
+        let clamped = if x > 1.0 { 1.0 } else if x < -1.0 { -1.0 } else { x };
+        let s = ptx_sqrt(ptx_abs(1.0 - clamped * clamped));
+        ptx_atan2(s, clamped)
     }
 
     fn rotl32(x: u32, k: u32) -> u32 {
@@ -773,7 +936,7 @@ mod kernels {
         } 
 
         let v2 = unsafe { *vx.get_unchecked_mut(i) * *vx.get_unchecked_mut(i) + *vy.get_unchecked_mut(i) * *vy.get_unchecked_mut(i) + *vz.get_unchecked_mut(i) * *vz.get_unchecked_mut(i) };
-        let velocity: Real = v2.sqrt();
+        let velocity: Real = ptx_sqrt(v2);
         let energy: Real = 0.5 * E_MASS * v2 / E_CHARGE; // EV_TO_J
         
         let c1 = (energy / (DE_CS as Real) + 0.5) as usize;
@@ -788,12 +951,14 @@ mod kernels {
 
         let rand_val = rng_next_f32(i, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
         
-        let p_coll: Real = 1.0 - (-nu * DT_E as Real).exp();
+        let p_coll: Real = 1.0 - ptx_exp(-nu * DT_E as Real);
         if rand_val < p_coll {
             collision_e(cs, &mut x, &mut vx, &mut vy, &mut vz, i, n_active, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
         }
         
     }
+
+    // TODO - options(may_diverge) sprawdź dla inline ptx.
 
     pub fn collision_e(cs: &[Real], x: &mut DisjointSlice<Real>, vx: &mut DisjointSlice<Real>, vy: &mut DisjointSlice<Real>, vz: &mut DisjointSlice<Real>, i: usize, 
                     n_active: &[u32], rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>) {
@@ -808,7 +973,7 @@ mod kernels {
         let mut gx: Real = unsafe { *vx.get_unchecked_mut(i) };
         let mut gy: Real = unsafe { *vy.get_unchecked_mut(i) };
         let mut gz: Real = unsafe { *vz.get_unchecked_mut(i) };
-        let mut g: Real = (gx * gx + gy * gy + gz * gz).sqrt();
+        let mut g: Real = ptx_sqrt(gx * gx + gy * gy + gz * gz);
         let wx: Real = F1 * unsafe { *vx.get_unchecked_mut(i) };
         let wy: Real = F1 * unsafe { *vy.get_unchecked_mut(i) };
         let wz: Real = F1 * unsafe { *vz.get_unchecked_mut(i) };
@@ -818,14 +983,14 @@ mod kernels {
         if gx == 0.0 as Real {
             theta = 0.5 * PI as Real;
         } else {
-            theta = (gy * gy + gz * gz).sqrt().atan2(gx);
+            theta = ptx_atan2(ptx_sqrt(gy * gy + gz * gz), gx);
         }
 
         if gy == 0.0 as Real {
             if gz >= 0.0 as Real { phi = 0.5 * PI as Real; }
             else { phi = -0.5 * PI as Real; }
         } else {
-            phi = gz.atan2(gy);
+            phi = ptx_atan2(gz, gy);
         }
 
         let chi: Real;
@@ -834,36 +999,36 @@ mod kernels {
         let mut cc: Real;
         let mut se: Real;
         let mut ce: Real;
-        let st: Real = theta.sin();
-        let ct: Real = theta.cos();
-        let sp: Real = phi.sin();
-        let cp: Real = phi.cos();
+        let st: Real = ptx_sin(theta);
+        let ct: Real = ptx_cos(theta);
+        let sp: Real = ptx_sin(phi);
+        let cp: Real = ptx_cos(phi);
 
         let rnd = rng_next_f32(i, rng0, rng1, rng2, rng3);
         if rnd < t0 / t2 {  // elastic scattering
-            chi = (1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3)).acos();
+            chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
             eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
         } else if rnd < t1 / t2 {  // excitation
             let mut energy = 0.5 * E_MASS as Real * g * g;
-            energy = (energy - E_EXC_TH as Real * E_CHARGE as Real).abs();
-            g = (2.0 as Real * energy / E_MASS as Real).sqrt();
-            chi = (1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3)).acos();
+            energy = ptx_abs(energy - E_EXC_TH as Real * E_CHARGE as Real);
+            g = ptx_sqrt(2.0 as Real * energy / E_MASS as Real);
+            chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
             eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
         } else {  // ionization
             let mut energy = 0.5 * E_MASS as Real * g * g;
-            energy = (energy - E_ION_TH as Real * E_CHARGE as Real).abs();
-            let e_new = 10.0 as Real * (rng_next_f32(i, rng0, rng1, rng2, rng3) * (energy / E_CHARGE as Real/20.0).atan()).tan() * E_CHARGE as Real;
-            let e_orig = (energy - e_new).abs();
-            g = (2.0 as Real * energy / E_MASS as Real).sqrt();
-            let g_new: Real = (2.0 as Real * e_new / E_MASS as Real).sqrt();
-            chi = (e_orig / energy).sqrt().acos();
-            let chi_new: Real = (e_new / energy).sqrt().acos();
+            energy = ptx_abs(energy - E_ION_TH as Real * E_CHARGE as Real);
+            let e_new = 10.0 as Real * ptx_tan(rng_next_f32(i, rng0, rng1, rng2, rng3) * ptx_atan(energy / E_CHARGE as Real/20.0)) * E_CHARGE as Real;
+            let e_orig = ptx_abs(energy - e_new);
+            g = ptx_sqrt(2.0 as Real * energy / E_MASS as Real);
+            let g_new: Real = ptx_sqrt(2.0 as Real * e_new / E_MASS as Real);
+            chi = ptx_acos(ptx_sqrt(e_orig / energy));
+            let chi_new: Real = ptx_acos(ptx_sqrt(e_new / energy));
             eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
             let eta_new: Real = eta + PI;
-            sc = chi_new.sin();
-            cc = chi_new.cos();
-            se = eta_new.sin();
-            ce = eta_new.cos();
+            sc = ptx_sin(chi_new);
+            cc = ptx_cos(chi_new);
+            se = ptx_sin(eta_new);
+            ce = ptx_cos(eta_new);
             gx = g_new * (ct * cc - st * sc * ce);
             gy = g_new * (st * cp * cc + ct * cp * sc * ce - sp * sc * se);
             gz = g_new * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
@@ -879,10 +1044,10 @@ mod kernels {
             // TODO - missing adding new ions
         }
 
-        sc = chi.sin();
-        cc = chi.cos();
-        se = eta.sin();
-        ce = eta.cos();
+        sc = ptx_sin(chi);
+        cc = ptx_cos(chi);
+        se = ptx_sin(eta);
+        ce = ptx_cos(eta);
         gx = g * (ct * cc - st * sc * ce);
         gy = g * (st * cp * cc + ct * cp * sc * ce - sp * sc * se);
         gz = g * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
