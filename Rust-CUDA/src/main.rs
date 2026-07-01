@@ -929,7 +929,9 @@ mod kernels {
     #[kernel]
     pub fn check_collisions_e(total_cs_e: &[Real], cs: &[Real], n_active: &[u32], 
                         mut x: DisjointSlice<Real>, mut vx: DisjointSlice<Real>, mut vy: DisjointSlice<Real>, mut vz: DisjointSlice<Real>, 
-                        mut rng0: DisjointSlice<u32>, mut rng1: DisjointSlice<u32>, mut rng2: DisjointSlice<u32>, mut rng3: DisjointSlice<u32>) {
+                        mut rng0: DisjointSlice<u32>, mut rng1: DisjointSlice<u32>, mut rng2: DisjointSlice<u32>, mut rng3: DisjointSlice<u32>,
+                        mut i_x: DisjointSlice<Real>, mut i_vx: DisjointSlice<Real>, mut i_vy: DisjointSlice<Real>, mut i_vz: DisjointSlice<Real>,
+                        n_ions: &[u32]) {
         let i = thread::index_1d().get();
         if i >= n_active[0] as usize { 
             return;
@@ -953,7 +955,8 @@ mod kernels {
         
         let p_coll: Real = 1.0 - ptx_exp(-nu * DT_E as Real);
         if rand_val < p_coll {
-            collision_e(cs, &mut x, &mut vx, &mut vy, &mut vz, i, n_active, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+            collision_e(cs, &mut x, &mut vx, &mut vy, &mut vz, i, energy_index, n_active, &mut rng0, &mut rng1, &mut rng2, &mut rng3,
+                       &mut i_x, &mut i_vx, &mut i_vy, &mut i_vz, n_ions);
         }
         
     }
@@ -961,15 +964,8 @@ mod kernels {
     // TODO - options(may_diverge) sprawdź dla inline ptx.
 
     pub fn collision_e(cs: &[Real], x: &mut DisjointSlice<Real>, vx: &mut DisjointSlice<Real>, vy: &mut DisjointSlice<Real>, vz: &mut DisjointSlice<Real>, i: usize, 
-                    n_active: &[u32], rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>) {
-        let t0: Real = cs[E_ELA * CS_RANGES + i];
-        let t1: Real = cs[E_EXC * CS_RANGES + i];
-        let t2: Real = cs[E_ION * CS_RANGES + i];
-
-    //  let energy -- initialized later
-    //  let e_new  -- initialized later
-    //  let e_orig -- initialized later
-
+                    energy_index: usize, n_active: &[u32], rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>,
+                    i_x: &mut DisjointSlice<Real>, i_vx: &mut DisjointSlice<Real>, i_vy: &mut DisjointSlice<Real>, i_vz: &mut DisjointSlice<Real>, n_ions: &[u32]) {
         let mut gx: Real = unsafe { *vx.get_unchecked_mut(i) };
         let mut gy: Real = unsafe { *vy.get_unchecked_mut(i) };
         let mut gz: Real = unsafe { *vz.get_unchecked_mut(i) };
@@ -977,6 +973,12 @@ mod kernels {
         let wx: Real = F1 * unsafe { *vx.get_unchecked_mut(i) };
         let wy: Real = F1 * unsafe { *vy.get_unchecked_mut(i) };
         let wz: Real = F1 * unsafe { *vz.get_unchecked_mut(i) };
+
+        // Cross-section lookup using energy_index (computed in check_collisions_e)
+        let t0: Real = cs[E_ELA * CS_RANGES + energy_index];
+        let t1: Real = cs[E_EXC * CS_RANGES + energy_index];
+        let t2: Real = cs[E_ION * CS_RANGES + energy_index];
+        let sigma_sum: Real = t0 + t1 + t2;
 
         let phi: Real;
         let theta: Real;
@@ -1019,7 +1021,7 @@ mod kernels {
             energy = ptx_abs(energy - E_ION_TH as Real * E_CHARGE as Real);
             let e_new = 10.0 as Real * ptx_tan(rng_next_f32(i, rng0, rng1, rng2, rng3) * ptx_atan(energy / E_CHARGE as Real/20.0)) * E_CHARGE as Real;
             let e_orig = ptx_abs(energy - e_new);
-            g = ptx_sqrt(2.0 as Real * energy / E_MASS as Real);
+            g = ptx_sqrt(2.0 as Real * e_orig / E_MASS as Real);
             let g_new: Real = ptx_sqrt(2.0 as Real * e_new / E_MASS as Real);
             chi = ptx_acos(ptx_sqrt(e_orig / energy));
             let chi_new: Real = ptx_acos(ptx_sqrt(e_new / energy));
@@ -1041,7 +1043,15 @@ mod kernels {
                 *vy.get_unchecked_mut(idx as usize) = gy;
                 *vz.get_unchecked_mut(idx as usize) = gz;
             }
-            // TODO - missing adding new ions
+            
+            let n_ions_alive = unsafe { &*(n_ions.as_ptr() as *const DeviceAtomicU32) };
+            let ion_idx = n_ions_alive.fetch_add(1, AtomicOrdering::Relaxed);
+            unsafe {
+                *i_x.get_unchecked_mut(ion_idx as usize) = *x.get_unchecked_mut(i);
+                *i_vx.get_unchecked_mut(ion_idx as usize) = 0.0 as Real; // TODO - properly initialize ion v
+                *i_vy.get_unchecked_mut(ion_idx as usize) = 0.0 as Real;
+                *i_vz.get_unchecked_mut(ion_idx as usize) = 0.0 as Real;
+            }
         }
 
         sc = ptx_sin(chi);
@@ -1053,9 +1063,9 @@ mod kernels {
         gz = g * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
 
         unsafe {
-            *vx.get_unchecked_mut(i) = wx + F2 + gx;
-            *vy.get_unchecked_mut(i) = wy + F2 + gy;
-            *vz.get_unchecked_mut(i) = wz + F2 + gz;
+            *vx.get_unchecked_mut(i) = wx + F2 * gx;
+            *vy.get_unchecked_mut(i) = wy + F2 * gy;
+            *vz.get_unchecked_mut(i) = wz + F2 * gz;
         }
     }
 }
@@ -1067,12 +1077,7 @@ fn init_particles(n: usize) -> ParticlesSoA {
     let sigma_v = (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt();
     let normal  = Normal::new(0.0f64, sigma_v).unwrap();
 
-    let mut particles = ParticlesSoA {
-        x:  vec![0.0 as Real; n],
-        vx: vec![0.0 as Real; n],
-        vy: vec![0.0 as Real; n],
-        vz: vec![0.0 as Real; n],
-    };
+    let mut particles = ParticlesSoA::with_capacity(MAX_PARTICLES);
 
     for i in 0..n {
         particles.x[i]  = (rng.random::<f64>() * L) as Real;
@@ -1232,11 +1237,11 @@ fn main() {
     let mut gpu = GpuSimState::allocate(&stream)
         .expect("Failed to allocate GPU memory");
     println!(">> eduPIC-GPU: GPU memory allocated (~{:.1} MB)",
-        (MAX_PARTICLES * PARTICLE_COMPS * SIZEOF_REAL * N_SPECIES  // particles (e + i)
+        (MAX_PARTICLES * PARTICLE_COMPS * SIZEOF_REAL * N_SPECIES   // particles (e + i)
         + N_CS * CS_RANGES * SIZEOF_REAL                            // cross sections
         + CS_RANGES * SIZEOF_REAL * N_SPECIES                       // sigma_tot_e + sigma_tot_i
         + N_G * N_GRID_ARRAYS * SIZEOF_REAL                         // grid arrays
-        + MAX_PARTICLES * 4 * 2                                       // RNG state (always u32)
+        + MAX_PARTICLES * 4 * 2                                     // RNG state (always u32)
         ) as f64 / BYTES_PER_MB
     );
 
