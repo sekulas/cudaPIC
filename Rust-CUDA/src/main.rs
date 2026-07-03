@@ -1028,7 +1028,7 @@ mod kernels {
             chi = ptx_acos(ptx_sqrt(e_orig / energy));
             let chi_new: Real = ptx_acos(ptx_sqrt(e_new / energy));
             eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
-            let eta_new: Real = eta + PI;
+            let eta_new: Real = eta + PI as Real;
             sc = ptx_sin(chi_new);
             cc = ptx_cos(chi_new);
             se = ptx_sin(eta_new);
