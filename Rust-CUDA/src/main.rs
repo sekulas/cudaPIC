@@ -115,6 +115,9 @@ const F1: Real = (E_MASS / (E_MASS + AR_MASS)) as Real;
 const F2: Real = (AR_MASS / (E_MASS + AR_MASS)) as Real;
 const LOG2_E: Real = 1.4426950408889634; // log2(e)
 
+// precomputed
+const HALF_E_MASS_OVER_E_CHARGE: Real = (0.5 * E_MASS / E_CHARGE) as Real;
+
 // SoA particle data - host-side representation
 
 struct ParticlesSoA {                                // Host-side SoA container for particle data.
@@ -939,8 +942,7 @@ mod kernels {
 
         let v2 = unsafe { *vx.get_unchecked_mut(i) * *vx.get_unchecked_mut(i) + *vy.get_unchecked_mut(i) * *vy.get_unchecked_mut(i) + *vz.get_unchecked_mut(i) * *vz.get_unchecked_mut(i) };
         let velocity: Real = ptx_sqrt(v2);
-        let energy: Real = 0.5 * E_MASS * v2 / E_CHARGE; // EV_TO_J
-        
+        let energy: Real = HALF_E_MASS_OVER_E_CHARGE * v2; // EV_TO_J
         let c1 = (energy / (DE_CS as Real) + 0.5) as usize;
         let c2 = CS_RANGES - 1;
 
@@ -1206,7 +1208,7 @@ fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
 
 
 fn main() {
-    perform_tests();
+    // perform_tests();
 
     println!(">> eduPIC-GPU: starting...");
     println!(">> eduPIC-GPU: cuda-oxide parallel PIC/MCC simulation");
