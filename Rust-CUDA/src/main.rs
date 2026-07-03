@@ -9,15 +9,15 @@
 
 use cuda_core::{memory, CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{cuda_module, kernel, thread, ptx_asm, DisjointSlice, SharedArray};
-use cuda_device::atomic::{AtomicOrdering, BlockAtomicF64, DeviceAtomicF64, DeviceAtomicU32};
+use cuda_device::atomic::{AtomicOrdering, BlockAtomicF32, DeviceAtomicF32, DeviceAtomicU32};
 use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
 use rand::RngExt;
 use rand_distr::Normal;
 use std::env;
 use std::time::Instant;
 
-/// Simulation precision: change to f32 for single-precision GPU computation.
-type Real = f64;
+/// TODO - Simulation precision: change to f32 for single-precision GPU computation.
+type Real = f32;
 
 // constants
 
@@ -111,8 +111,8 @@ const COMPACT_NUM_WARPS:  usize = COMPACT_BLOCK_SIZE as usize / 32;   // = 8
 
 // collisions
 const NORMAL_RANGE: Real = 269.90040554976775; // (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt();  // thermal velocity of background gas [m/s]
-const F1: Real = E_MASS / (E_MASS + AR_MASS);
-const F2: Real = AR_MASS / (E_MASS + AR_MASS);
+const F1: Real = (E_MASS / (E_MASS + AR_MASS)) as Real;
+const F2: Real = (AR_MASS / (E_MASS + AR_MASS)) as Real;
 const LOG2_E: Real = 1.4426950408889634; // log2(e)
 
 // SoA particle data - host-side representation
@@ -437,12 +437,12 @@ mod kernels {
             let pos = x[i] * INV_DX as Real;
             let q   = pos as usize;
             let rem  = pos - q as Real;
-            let c1   = (1.0 as Real - rem) * WEIGHT_FACTOR;
-            let c2   = rem * WEIGHT_FACTOR;
+            let c1   = (1.0 as Real - rem) * WEIGHT_FACTOR as Real;
+            let c2   = rem * WEIGHT_FACTOR as Real;
 
             unsafe {
                 let p: *mut SharedArray<Real, N_G> = &raw mut LOCAL_DENSITY;
-                let local_base = (*p).as_mut_ptr() as *const BlockAtomicF64; // TODO - F32 Atomic??
+                let local_base = (*p).as_mut_ptr() as *const BlockAtomicF32;
 
                 (*local_base.add(q    )).fetch_add(c1, AtomicOrdering::Relaxed);
                 (*local_base.add(q + 1)).fetch_add(c2, AtomicOrdering::Relaxed);
@@ -451,7 +451,7 @@ mod kernels {
         thread::sync_threads();
 
         // Flush to global density | Device-scope atomics
-        let global_density = density.as_ptr() as *const DeviceAtomicF64; // TODO - F32 Atomic??
+        let global_density = density.as_ptr() as *const DeviceAtomicF32;
         let mut k = tid;
         while k < N_G {
             let mut val = unsafe { LOCAL_DENSITY[k] };
@@ -1231,7 +1231,6 @@ fn main() {
     // 3. Initialize particles on CPU (SoA layout)
     let electrons_host = init_particles(N_INIT);
     let ions_host      = init_particles(N_INIT);
-    let n_init_active  = N_INIT as u32;
 
     // 4. Allocate all GPU buffers
     let mut gpu = GpuSimState::allocate(&stream)
@@ -1246,15 +1245,15 @@ fn main() {
     );
 
     // 5. Upload data to GPU (one-time PCIe transfer)
-    gpu.upload_electrons(&stream, &electrons_host, n_init_active)
+    gpu.upload_electrons(&stream, &electrons_host, N_INIT as u32)
         .expect("Failed to upload electrons");
-    gpu.upload_ions(&stream, &ions_host, n_init_active)
+    gpu.upload_ions(&stream, &ions_host, N_INIT as u32)
         .expect("Failed to upload ions");
     gpu.upload_cross_sections(&stream, &cs_flat, &sigma_tot_e, &sigma_tot_i)
         .expect("Failed to upload cross-sections");
 
-    let e_seeds = xoshiro128_seed_streams([0x1234_5678, 0x1111_2222, 0x2222_3333, 0x3333_4444], MAX_PARTICLES as usize);
-    let i_seeds = xoshiro128_seed_streams([0x4444_5555, 0x5555_6666, 0x6666_7777, 0x7777_8888], MAX_PARTICLES as usize);
+    let e_seeds = xoshiro128_seed_streams([0x1234_5678, 0x1111_2222, 0x2222_3333, 0x3333_4444], MAX_PARTICLES);
+    let i_seeds = xoshiro128_seed_streams([0x4444_5555, 0x5555_6666, 0x6666_7777, 0x7777_8888], MAX_PARTICLES);
     gpu.upload_rng_state(&stream, &e_seeds, &i_seeds)
         .expect("Failed to upload RNG state");
 
