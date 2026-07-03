@@ -978,9 +978,8 @@ mod kernels {
 
         // Cross-section lookup using energy_index (computed in check_collisions_e)
         let t0: Real = cs[E_ELA * CS_RANGES + energy_index];
-        let t1: Real = cs[E_EXC * CS_RANGES + energy_index];
-        let t2: Real = cs[E_ION * CS_RANGES + energy_index];
-        let sigma_sum: Real = t0 + t1 + t2;
+        let t1: Real = t0 + cs[E_EXC * CS_RANGES + energy_index];
+        let t2: Real = t1 + cs[E_ION * CS_RANGES + energy_index];
 
         let phi: Real;
         let theta: Real;
