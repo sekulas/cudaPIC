@@ -190,6 +190,15 @@ struct GpuSimState {
     rng_i1: DeviceBuffer<u32>,
     rng_i2: DeviceBuffer<u32>,
     rng_i3: DeviceBuffer<u32>,
+
+    // double-buffer pattern for check_boundaries stream compaction
+    tmp_x:  DeviceBuffer<Real>,
+    tmp_vx: DeviceBuffer<Real>,
+    tmp_vy: DeviceBuffer<Real>,
+    tmp_vz: DeviceBuffer<Real>,
+
+    // alive counter for stream compaction
+    alive_counter: DeviceBuffer<u32>,
 }
 
 impl GpuSimState {
@@ -234,7 +243,15 @@ impl GpuSimState {
             rng_i0: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
             rng_i1: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
             rng_i2: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
-            rng_i3: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,        })
+            rng_i3: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
+
+            // tmp buffers for stream compaction
+            tmp_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            tmp_vx: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            tmp_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            tmp_vz: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            alive_counter: DeviceBuffer::<u32>::zeroed(stream, 1)?,
+        })
     }
 
     // upload initial particle data from host.
@@ -1260,50 +1277,114 @@ fn main() {
 
     println!(">> eduPIC-GPU: data uploaded to GPU");
 
-    // 6. Launch config - fixed for entire simulation (zero-sync pattern)
+    // 6. Launch configs
     let cfg = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
+    let poisson_cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (SCAN_BLOCK_SIZE, 1, 1),
+        shared_mem_bytes: 0,
+    };
 
     // 7. GPU simulation loop
-    // all kernels launched on same stream
-    println!(">> eduPIC-GPU: running {} cycles × {} steps (GPU-resident)...", num_cycles, N_T);
+    println!(">> eduPIC-GPU: running {} cycles x{} steps...", num_cycles, N_T);
     let module = kernels::load(&ctx).expect("Failed to load CUDA module");
-    
-    for _cycle in 0..num_cycles {
-        for _t in 0..N_T {
-            module.move_particles(&stream, cfg,
-                &gpu.efield, &mut gpu.e_x, &mut gpu.e_vx,
-                n_init_active, FACTOR_E as Real, DT_E as Real,
-            ).expect("move_particles (electrons) failed");
-            // zero density buffers
+
+    let mut n_e: u32 = N_INIT as u32;
+    let mut n_i: u32 = N_INIT as u32;
+
+    for cycle in 0..num_cycles {
+        for t in 0..N_T {
             unsafe {
                 memory::memset_d8_async(gpu.e_density.cu_deviceptr(), 0, gpu.e_density.num_bytes(), stream.cu_stream()).expect("memset e_density failed");
-                memory::memset_d8_async(gpu.i_density.cu_deviceptr(), 0, gpu.i_density.num_bytes(), stream.cu_stream()).expect("memset i_density failed");
             }
             module.get_density(&stream, cfg,
-                &gpu.e_x, &gpu.e_density, n_init_active,
+                &gpu.e_x, &gpu.e_density, n_e,
             ).expect("get_density (electrons) failed");
-            // module.deposit_charge_e(&stream, cfg, ...)?;
-            // module.deposit_charge_i(&stream, cfg, ...)?;
-            // module.solve_poisson(&stream, poisson_cfg, ...)?;
-            // if _t % N_SUB == 0 {
-            //     module.move_particles(&stream, cfg,
-            //         &gpu.efield, &mut gpu.i_x, &mut gpu.i_vx,
-            //         n_init_active, FACTOR_I as Real, DT_I as Real,
-            //     ).expect("move_particles (ions) failed");
-            // }
-            // module.check_boundaries_e(&stream, cfg, ...)?;
-            // module.check_boundaries_i(&stream, cfg, ...)?;
-            // module.collisions_e(&stream, cfg, ...)?;  // ionization appends directly
-            // if _t % N_SUB == 0 { module.collisions_i(&stream, cfg, ...)?; }
+
+            if t % N_SUB == 0 {
+                unsafe {
+                    memory::memset_d8_async(gpu.i_density.cu_deviceptr(), 0, gpu.i_density.num_bytes(), stream.cu_stream()).expect("memset i_density failed");
+                }
+                module.get_density(&stream, cfg,
+                    &gpu.i_x, &gpu.i_density, n_i,
+                ).expect("get_density (ions) failed");
+            }
+
+            let pot0 = (VOLTAGE * ((t as f64 / N_T as f64) * TWO_PI ).cos() as f64) as f32;
+            module.solve_poisson_scan_f32(&stream, poisson_cfg,
+                &gpu.e_density, &gpu.i_density, &mut gpu.pot, &mut gpu.efield, pot0,
+            ).expect("solve_poisson failed");
+
+            module.move_particles(&stream, cfg,
+                &gpu.efield, &mut gpu.e_x, &mut gpu.e_vx,
+                n_e, FACTOR_E as Real, DT_E as Real,
+            ).expect("move_particles (electrons) failed");
+
+            if t % N_SUB == 0 {
+                module.move_particles(&stream, cfg,
+                    &gpu.efield, &mut gpu.i_x, &mut gpu.i_vx,
+                    n_i, FACTOR_I as Real, DT_I as Real,
+                ).expect("move_particles (ions) failed");
+            }
+
+            unsafe {
+                memory::memset_d8_async(gpu.alive_counter.cu_deviceptr(), 0, gpu.alive_counter.num_bytes(), stream.cu_stream())
+                    .expect("memset alive_counter failed");
+            }
+            module.check_boundaries_compact(&stream, cfg,
+                &gpu.e_x, &gpu.e_vx, &gpu.e_vy, &gpu.e_vz,
+                &mut gpu.tmp_x, &mut gpu.tmp_vx, &mut gpu.tmp_vy, &mut gpu.tmp_vz,
+                &gpu.alive_counter, n_e,
+            ).expect("check_boundaries (electrons) failed");
+            std::mem::swap(&mut gpu.e_x,  &mut gpu.tmp_x);
+            std::mem::swap(&mut gpu.e_vx, &mut gpu.tmp_vx);
+            std::mem::swap(&mut gpu.e_vy, &mut gpu.tmp_vy);
+            std::mem::swap(&mut gpu.e_vz, &mut gpu.tmp_vz);
+            n_e = gpu.alive_counter.to_host_vec(&stream).unwrap()[0];
+
+            if t % N_SUB == 0 {
+                unsafe {
+                    memory::memset_d8_async(gpu.alive_counter.cu_deviceptr(), 0, gpu.alive_counter.num_bytes(), stream.cu_stream())
+                        .expect("memset alive_counter failed");
+                }
+                module.check_boundaries_compact(&stream, cfg,
+                    &gpu.i_x, &gpu.i_vx, &gpu.i_vy, &gpu.i_vz,
+                    &mut gpu.tmp_x, &mut gpu.tmp_vx, &mut gpu.tmp_vy, &mut gpu.tmp_vz,
+                    &gpu.alive_counter, n_i,
+                ).expect("check_boundaries (ions) failed");
+                std::mem::swap(&mut gpu.i_x,  &mut gpu.tmp_x);
+                std::mem::swap(&mut gpu.i_vx, &mut gpu.tmp_vx);
+                std::mem::swap(&mut gpu.i_vy, &mut gpu.tmp_vy);
+                std::mem::swap(&mut gpu.i_vz, &mut gpu.tmp_vz);
+                n_i = gpu.alive_counter.to_host_vec(&stream).unwrap()[0];
+            }
+
+            gpu.n_electrons = DeviceBuffer::from_host(&stream, &[n_e]).unwrap();
+            gpu.n_ions      = DeviceBuffer::from_host(&stream, &[n_i]).unwrap();
+
+            module.check_collisions_e(&stream, cfg,
+                &gpu.sigma_tot_e, &gpu.cs, &gpu.n_electrons,
+                &mut gpu.e_x, &mut gpu.e_vx, &mut gpu.e_vy, &mut gpu.e_vz,
+                &mut gpu.rng_e0, &mut gpu.rng_e1, &mut gpu.rng_e2, &mut gpu.rng_e3,
+                &mut gpu.i_x, &mut gpu.i_vx, &mut gpu.i_vy, &mut gpu.i_vz,
+                &gpu.n_ions,
+            ).expect("check_collisions_e failed");
+
+            n_e = gpu.n_electrons.to_host_vec(&stream).unwrap()[0].min(MAX_PARTICLES as u32);
+            n_i = gpu.n_ions.to_host_vec(&stream).unwrap()[0].min(MAX_PARTICLES as u32);
+
+            // TODO - check_collisions_i
         }
+
+        println!("   cycle {}/{}: n_e={}, n_i={}", cycle + 1, num_cycles, n_e, n_i);
     }
 
     // 8. Synchronize and download results
     ctx.synchronize().expect("CUDA synchronization failed");
 
-    let (electrons_result, n_e_final) = gpu.download_electrons(&stream)
+    let (_electrons_result, n_e_final) = gpu.download_electrons(&stream)
         .expect("Failed to download electrons");
-    let (ions_result, n_i_final) = gpu.download_ions(&stream)
+    let (_ions_result, n_i_final) = gpu.download_ions(&stream)
         .expect("Failed to download ions");
 
     let elapsed = start.elapsed().as_secs_f64();
