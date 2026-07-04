@@ -1057,9 +1057,9 @@ mod kernels {
             let idx = n_alive.fetch_add(1, AtomicOrdering::Relaxed);
             unsafe {
                 *x.get_unchecked_mut(idx as usize) = *x.get_unchecked_mut(i);
-                *vx.get_unchecked_mut(idx as usize) = gx;
-                *vy.get_unchecked_mut(idx as usize) = gy;
-                *vz.get_unchecked_mut(idx as usize) = gz;
+                *vx.get_unchecked_mut(idx as usize) = (wx + F2 * gx);
+                *vy.get_unchecked_mut(idx as usize) = (wy + F2 * gy);
+                *vz.get_unchecked_mut(idx as usize) = (wz + F2 * gz);
             }
             
             let n_ions_alive = unsafe { &*(n_ions.as_ptr() as *const DeviceAtomicU32) };
