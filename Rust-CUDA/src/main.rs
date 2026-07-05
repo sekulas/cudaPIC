@@ -911,6 +911,21 @@ mod kernels {
         ptx_atan2(s, clamped)
     }
 
+    #[inline(always)]
+    fn ptx_max(x: Real, y: Real) -> Real {
+        let mut result;
+        unsafe {
+            ptx_asm!(
+                "max.f32 %0, %1, %2;",
+                out("=f") result,
+                in("f") x,
+                in("f") y,
+                options(register_only),
+            );
+        }
+        result
+    }
+
     fn rotl32(x: u32, k: u32) -> u32 {
         (x << k) | (x >> (32 - k))
     }
