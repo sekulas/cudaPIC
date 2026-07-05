@@ -117,6 +117,7 @@ const LOG2_E: Real = 1.4426950408889634; // log2(e)
 
 // precomputed
 const HALF_E_MASS_OVER_E_CHARGE: Real = (0.5 * E_MASS / E_CHARGE) as Real;
+const HALF_MU_ARAR_OVER_E_CHARGE: Real = (0.5 * MU_ARAR / E_CHARGE) as Real;
 
 // SoA particle data - host-side representation
 
@@ -668,9 +669,6 @@ mod kernels {
         }
     }
 
-    // TODO: collisions_e (electron-neutral MCC, ionization appends directly / ...)
-    // TODO: collisions_i (ion-neutral MCC / ...)
-
     /// testing: flexible Double-Prefix-Sum Poisson solver for convergence testing
     /// solves ψ[i-1] - 2ψ[i] + ψ[i+1] = f[i] where f[i] = dx²·source[i].
     /// outputs only potential (no E-field) since convergence test needs only ψ.
@@ -1128,9 +1126,9 @@ mod kernels {
             let idx = n_alive.fetch_add(1, AtomicOrdering::Relaxed);
             unsafe {
                 *x.get_unchecked_mut(idx as usize) = *x.get_unchecked_mut(i);
-                *vx.get_unchecked_mut(idx as usize) = (wx + F2 * gx);
-                *vy.get_unchecked_mut(idx as usize) = (wy + F2 * gy);
-                *vz.get_unchecked_mut(idx as usize) = (wz + F2 * gz);
+                *vx.get_unchecked_mut(idx as usize) = wx + F2 * gx;
+                *vy.get_unchecked_mut(idx as usize) = wy + F2 * gy;
+                *vz.get_unchecked_mut(idx as usize) = wz + F2 * gz;
             }
             
             let n_ions_alive = unsafe { &*(n_ions.as_ptr() as *const DeviceAtomicU32) };
@@ -1155,6 +1153,122 @@ mod kernels {
             *vx.get_unchecked_mut(i) = wx + F2 * gx;
             *vy.get_unchecked_mut(i) = wy + F2 * gy;
             *vz.get_unchecked_mut(i) = wz + F2 * gz;
+        }
+    }
+
+    #[kernel]
+    pub fn check_collisions_i(
+        total_cs_i: &[Real],
+        cs: &[Real],
+        n_active: &[u32],
+        mut vx: DisjointSlice<Real>,
+        mut vy: DisjointSlice<Real>,
+        mut vz: DisjointSlice<Real>,
+        mut rng0: DisjointSlice<u32>,
+        mut rng1: DisjointSlice<u32>,
+        mut rng2: DisjointSlice<u32>,
+        mut rng3: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= n_active[0] as usize {
+            return;
+        }
+
+        let (vxa, vya, vza) = rng_next_three_normal(i, NORMAL_RANGE, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+
+        let gx = unsafe { *vx.get_unchecked_mut(i) } - vxa;
+        let gy = unsafe { *vy.get_unchecked_mut(i) } - vya;
+        let gz = unsafe { *vz.get_unchecked_mut(i) } - vza;
+        let g2 = gx * gx + gy * gy + gz * gz;
+        let g = ptx_sqrt(g2);
+
+        let energy: Real = HALF_MU_ARAR_OVER_E_CHARGE * g2;
+        let c1 = (energy / (DE_CS as Real) + 0.5) as usize;
+        let c2 = CS_RANGES - 1;
+        let energy_index = c1.min(c2);
+
+        let nu: Real = if PRECOMPUTE_COLLISION_FREQ { // TODO - can be removed if we do the choice
+            total_cs_i[energy_index]
+        } else {
+            total_cs_i[energy_index] * g
+        };
+
+        let rand_val = rng_next_f32(i, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+        let p_coll: Real = 1.0 - ptx_exp(-nu * DT_I as Real);
+        if rand_val < p_coll {
+            collision_i(cs, &mut vx, &mut vy, &mut vz, i,
+                        vxa, vya, vza, energy_index,
+                        &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+        }
+    }
+
+    pub fn collision_i(
+        cs: &[Real],
+        vx: &mut DisjointSlice<Real>,
+        vy: &mut DisjointSlice<Real>,
+        vz: &mut DisjointSlice<Real>,
+        i: usize,
+        vxa: Real,
+        vya: Real,
+        vza: Real,
+        energy_index: usize,
+        rng0: &mut DisjointSlice<u32>,
+        rng1: &mut DisjointSlice<u32>,
+        rng2: &mut DisjointSlice<u32>,
+        rng3: &mut DisjointSlice<u32>,
+    ) {
+        let t0: Real = cs[I_ISO * CS_RANGES + energy_index];
+        let t1: Real = t0 + cs[I_BACK * CS_RANGES + energy_index];
+
+        let phi: Real;
+        let theta: Real;
+        let chi: Real;
+
+        let mut gx: Real = unsafe { *vx.get_unchecked_mut(i) } - vxa;
+        let mut gy: Real = unsafe { *vy.get_unchecked_mut(i) } - vya;
+        let mut gz: Real = unsafe { *vz.get_unchecked_mut(i) } - vza;
+        let g: Real = ptx_sqrt(gx * gx + gy * gy + gz * gz);
+        let wx: Real = 0.5 * (unsafe { *vx.get_unchecked_mut(i) } + vxa);
+        let wy: Real = 0.5 * (unsafe { *vy.get_unchecked_mut(i) } + vya);
+        let wz: Real = 0.5 * (unsafe { *vz.get_unchecked_mut(i) } + vza);
+
+        if gx == 0.0 as Real {
+            theta = 0.5 * PI as Real;
+        } else {
+            theta = ptx_atan2(ptx_sqrt(gy * gy + gz * gz), gx);
+        }
+        if gy == 0.0 as Real {
+            if gz >= 0.0 as Real { phi = 0.5 * PI as Real; }
+            else { phi = -0.5 * PI as Real; }
+        } else {
+            phi = ptx_atan2(gz, gy);
+        }
+
+        let rnd = rng_next_f32(i, rng0, rng1, rng2, rng3);
+        if rnd < t0 / t1 {
+            chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
+        } else {
+            chi = PI as Real;
+        }
+        let eta: Real = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
+
+        let sc: Real = ptx_sin(chi);
+        let cc: Real = ptx_cos(chi);
+        let se: Real = ptx_sin(eta);
+        let ce: Real = ptx_cos(eta);
+        let st: Real = ptx_sin(theta);
+        let ct: Real = ptx_cos(theta);
+        let sp: Real = ptx_sin(phi);
+        let cp: Real = ptx_cos(phi);
+
+        gx = g * (ct * cc - st * sc * ce);
+        gy = g * (st * cp * cc + ct * cp * sc * ce - sp * sc * se);
+        gz = g * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
+
+        unsafe {
+            *vx.get_unchecked_mut(i) = wx + 0.5 * gx;
+            *vy.get_unchecked_mut(i) = wy + 0.5 * gy;
+            *vz.get_unchecked_mut(i) = wz + 0.5 * gz;
         }
     }
 }
