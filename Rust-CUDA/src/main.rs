@@ -961,6 +961,62 @@ mod kernels {
         u32_to_real(result)
     }
 
+    fn rng_next_three_normal(
+        i: usize, 
+        sigma: Real, // standard deviation of the normal distribution
+        rng0: &mut DisjointSlice<u32>, 
+        rng1: &mut DisjointSlice<u32>, 
+        rng2: &mut DisjointSlice<u32>, 
+        rng3: &mut DisjointSlice<u32>
+    ) -> (Real, Real, Real) {
+        
+        let mut s0 = unsafe { *rng0.get_unchecked_mut(i) };
+        let mut s1 = unsafe { *rng1.get_unchecked_mut(i) };
+        let mut s2 = unsafe { *rng2.get_unchecked_mut(i) };
+        let mut s3 = unsafe { *rng3.get_unchecked_mut(i) };
+
+        let (r1, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
+        s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
+
+        let (r2, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
+        s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
+
+        let (r3, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
+        s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
+
+        // fourth random for Box-Muller, but not used
+        let (r4, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
+        
+        unsafe {
+            *rng0.get_unchecked_mut(i) = ns0;
+            *rng1.get_unchecked_mut(i) = ns1;
+            *rng2.get_unchecked_mut(i) = ns2;
+            *rng3.get_unchecked_mut(i) = ns3;
+        }
+
+        let f1 = u32_to_real(r1);
+        let f2 = u32_to_real(r2);
+        let f3 = u32_to_real(r3);
+        let f4 = u32_to_real(r4);
+        let u1 = ptx_max(f1, 1e-9 as Real);
+        let u2 = ptx_max(f2, 1e-9 as Real);
+        let u3 = ptx_max(f3, 1e-9 as Real);
+        let u4 = ptx_max(f4, 1e-9 as Real);
+
+        let rad1 = ptx_sqrt(-2.0 as Real * ptx_lg2(u1) * (1.0 / LOG2_E));
+        let angle1 = TWO_PI as Real * u2;
+        
+        let z0 = rad1 * ptx_cos(angle1);
+        let z1 = rad1 * ptx_sin(angle1);
+
+        let rad2 = ptx_sqrt(-2.0 as Real * ptx_lg2(u3) * (1.0 / LOG2_E));
+        let angle2 = TWO_PI as Real * u4;
+        
+        let z2 = rad2 * ptx_cos(angle2);
+
+        (z0 * sigma, z1 * sigma, z2 * sigma)
+    }
+
     #[kernel]
     pub fn check_collisions_e(total_cs_e: &[Real], cs: &[Real], n_active: &[u32], 
                         mut x: DisjointSlice<Real>, mut vx: DisjointSlice<Real>, mut vy: DisjointSlice<Real>, mut vz: DisjointSlice<Real>, 
