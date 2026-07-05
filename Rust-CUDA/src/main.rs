@@ -13,8 +13,10 @@ use cuda_device::atomic::{AtomicOrdering, BlockAtomicF32, DeviceAtomicF32, Devic
 use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
 use rand::RngExt;
 use rand_distr::Normal;
-use std::env;
+use std::{env, fmt};
 use std::time::Instant;
+use std::io::BufWriter;
+
 
 /// TODO - Simulation precision: change to f32 for single-precision GPU computation.
 type Real = f32;
@@ -1408,6 +1410,69 @@ fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
 }
 
 
+enum ParticleSpecies {
+    Electrons = 0,
+    Ions      = 1,
+}
+
+impl fmt::Display for ParticleSpecies {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ParticleSpecies::Electrons => write!(f, "electrons"),
+            ParticleSpecies::Ions      => write!(f, "ions"),
+        }
+    }
+}
+
+
+use std::fs::{self, File};
+use std::io::Write;
+use chrono::{DateTime, Utc};
+use chrono_tz::Europe::Warsaw;
+use chrono_tz::Tz;
+
+fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, species: ParticleSpecies, tsmp: DateTime<Tz>) {
+    let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
+
+    let dir_path = format!("results/{}", time_stamp);
+    fs::create_dir_all(&dir_path).expect("Unable to create directory");
+    let filename = format!("{}/{:04}_{}_{}.csv", dir_path, step, time_stamp, species);
+
+    let mut file = File::create(&filename).expect("Unable to create file");
+    let mut writer = BufWriter::new(file);
+    
+    writeln!(writer, "x,vx,vy,vz").expect("Unable to write header");
+    
+    for i in 0..amount {
+        writeln!(
+            writer,
+            "{},{},{},{}",
+            particles.x[i], particles.vx[i], particles.vy[i], particles.vz[i]
+        )
+        .expect("Unable to write particle data");
+    }
+}
+
+const CHECKPOINT_CYCLES: usize = 10;
+
+fn save_particle_growth_data(n_e: Vec<u32>, n_i: Vec<u32>, tsmp: DateTime<Tz>) {
+    let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
+
+    let dir_path = format!("results/{}", time_stamp);
+    fs::create_dir_all(&dir_path).expect("Unable to create directory");
+    let filename = format!("{}/particle_growth_{}.csv", dir_path, time_stamp);
+
+    let mut file = File::create(&filename).expect("Unable to create file");
+    writeln!(file, "step,n_e,n_i").expect("Unable to write header");
+
+    for (step, (&n_e_val, &n_i_val)) in n_e.iter().zip(n_i.iter()).enumerate() {
+        writeln!(file, "{},{},{}", step*CHECKPOINT_CYCLES, n_e_val, n_i_val).expect("Unable to write particle growth data");
+    }
+}
+
+
+
+
 fn main() {
     // perform_tests();
 
@@ -1476,6 +1541,10 @@ fn main() {
 
     let mut n_e: u32 = N_INIT as u32;
     let mut n_i: u32 = N_INIT as u32;
+    let mut n_e_history: Vec<u32> = Vec::with_capacity(num_cycles / CHECKPOINT_CYCLES + 1);
+    let mut n_i_history: Vec<u32> = Vec::with_capacity(num_cycles / CHECKPOINT_CYCLES + 1);
+    n_e_history.push(n_e);
+    n_i_history.push(n_i);
 
     for cycle in 0..num_cycles {
         for t in 0..N_T {
@@ -1555,13 +1624,25 @@ fn main() {
                 &gpu.n_ions,
             ).expect("check_collisions_e failed");
 
-            n_e = gpu.n_electrons.to_host_vec(&stream).unwrap()[0].min(MAX_PARTICLES as u32);
-            n_i = gpu.n_ions.to_host_vec(&stream).unwrap()[0].min(MAX_PARTICLES as u32);
+            n_e = gpu.n_electrons.to_host_vec(&stream).unwrap()[0];
+            n_i = gpu.n_ions.to_host_vec(&stream).unwrap()[0];
 
-            // TODO - check_collisions_i
+            if t % N_SUB == 0 {
+                module.check_collisions_i(&stream, cfg,
+                    &gpu.sigma_tot_i, &gpu.cs, &gpu.n_ions,
+                    &mut gpu.i_vx, &mut gpu.i_vy, &mut gpu.i_vz,
+                    &mut gpu.rng_i0, &mut gpu.rng_i1, &mut gpu.rng_i2, &mut gpu.rng_i3,
+                ).expect("check_collisions_i failed");
+            }
         }
 
-        println!("   cycle {}/{}: n_e={}, n_i={}", cycle + 1, num_cycles, n_e, n_i);
+        if (cycle + 1) % CHECKPOINT_CYCLES == 0 {
+            println!("   checkpoint at cycle {}: n_e={}, n_i={}", cycle + 1, n_e, n_i);
+            n_e = gpu.n_electrons.to_host_vec(&stream).unwrap()[0];
+            n_i = gpu.n_ions.to_host_vec(&stream).unwrap()[0];
+            n_e_history.push(n_e);
+            n_i_history.push(n_i);
+        }
     }
 
     // 8. Synchronize and download results
@@ -1575,6 +1656,11 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64();
     println!(">> eduPIC-GPU: simulation complete in {:.3} s", elapsed);
     println!(">> eduPIC-GPU: final particles: {} electrons, {} ions", n_e_final, n_i_final);
+
+    let tsmp = chrono::Utc::now().with_timezone(&Warsaw);
+    save_particle_data(&_electrons_result, n_e_final as usize, num_cycles, ParticleSpecies::Electrons, tsmp);
+    save_particle_data(&_ions_result, n_i_final as usize, num_cycles, ParticleSpecies::Ions, tsmp);
+    save_particle_growth_data(n_e_history, n_i_history, tsmp);
 }
 
 // tests

@@ -11,3 +11,5 @@ cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git" }
 rand = "0.10.1"
 rand_distr = "0.6.0"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
