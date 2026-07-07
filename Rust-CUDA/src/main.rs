@@ -1548,17 +1548,13 @@ fn main() {
 
     for cycle in 0..num_cycles {
         for t in 0..N_T {
-            unsafe {
-                memory::memset_d8_async(gpu.e_density.cu_deviceptr(), 0, gpu.e_density.num_bytes(), stream.cu_stream()).expect("memset e_density failed");
-            }
+            gpu.e_density.zero_async(&stream).expect("Failed to zero e_density");
             module.get_density(&stream, cfg,
                 &gpu.e_x, &gpu.e_density, n_e,
             ).expect("get_density (electrons) failed");
 
             if t % N_SUB == 0 {
-                unsafe {
-                    memory::memset_d8_async(gpu.i_density.cu_deviceptr(), 0, gpu.i_density.num_bytes(), stream.cu_stream()).expect("memset i_density failed");
-                }
+                gpu.i_density.zero_async(&stream).expect("Failed to zero i_density");
                 module.get_density(&stream, cfg,
                     &gpu.i_x, &gpu.i_density, n_i,
                 ).expect("get_density (ions) failed");
@@ -1581,10 +1577,7 @@ fn main() {
                 ).expect("move_particles (ions) failed");
             }
 
-            unsafe {
-                memory::memset_d8_async(gpu.alive_counter.cu_deviceptr(), 0, gpu.alive_counter.num_bytes(), stream.cu_stream())
-                    .expect("memset alive_counter failed");
-            }
+            gpu.alive_counter.zero_async(&stream).expect("Failed to zero alive_counter");
             module.check_boundaries_compact(&stream, cfg,
                 &gpu.e_x, &gpu.e_vx, &gpu.e_vy, &gpu.e_vz,
                 &mut gpu.tmp_x, &mut gpu.tmp_vx, &mut gpu.tmp_vy, &mut gpu.tmp_vz,
@@ -1598,8 +1591,7 @@ fn main() {
 
             if t % N_SUB == 0 {
                 unsafe {
-                    memory::memset_d8_async(gpu.alive_counter.cu_deviceptr(), 0, gpu.alive_counter.num_bytes(), stream.cu_stream())
-                        .expect("memset alive_counter failed");
+                    gpu.alive_counter.zero_async(&stream).expect("Failed to zero alive_counter");
                 }
                 module.check_boundaries_compact(&stream, cfg,
                     &gpu.i_x, &gpu.i_vx, &gpu.i_vy, &gpu.i_vz,
