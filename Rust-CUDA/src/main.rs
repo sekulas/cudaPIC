@@ -7,7 +7,7 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use cuda_core::{memory, CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{memory, CudaContext, DeviceBuffer, PinnedHostBuffer, LaunchConfig};
 use cuda_device::{cuda_module, kernel, thread, ptx_asm, DisjointSlice, SharedArray};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicF32, DeviceAtomicF32, DeviceAtomicU32};
 use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
@@ -1534,6 +1534,8 @@ fn main() {
         block_dim: (SCAN_BLOCK_SIZE, 1, 1),
         shared_mem_bytes: 0,
     };
+    let mut h_counter_e = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
+    let mut h_counter_i = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
 
     // 7. GPU simulation loop
     println!(">> eduPIC-GPU: running {} cycles x{} steps...", num_cycles, N_T);
@@ -1546,8 +1548,8 @@ fn main() {
     n_e_history.push(n_e);
     n_i_history.push(n_i);
 
-    let cfg_e = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
-    let cfg_i = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
+    let cfg_e = cfg;
+    let cfg_i = cfg;
 
     for cycle in 0..num_cycles {
         for t in 0..N_T {
@@ -1624,11 +1626,16 @@ fn main() {
         }
 
         if (cycle + 1) % CHECKPOINT_CYCLES == 0 {
-            println!("   checkpoint at cycle {}: n_e={}, n_i={}", cycle + 1, n_e, n_i);
-            n_e = gpu.n_electrons.to_host_vec(&stream).unwrap()[0];
-            n_i = gpu.n_ions.to_host_vec(&stream).unwrap()[0];
-            n_e_history.push(n_e);
-            n_i_history.push(n_i);
+            unsafe { gpu.n_electrons.copy_to_pinned_host_async(&stream, &mut h_counter_e) }
+                .expect("copy_to_pinned_host_async n_electrons checkpoint failed");
+            unsafe { gpu.n_ions.copy_to_pinned_host_async(&stream, &mut h_counter_i) }
+                .expect("copy_to_pinned_host_async n_ions checkpoint failed");
+                
+            stream.synchronize().unwrap();
+
+            println!("   checkpoint at cycle {}: n_e={}, n_i={}", cycle + 1, h_counter_e[0], h_counter_i[0]);
+            n_e_history.push(h_counter_e[0]);
+            n_i_history.push(h_counter_i[0]);
         }
     }
 
