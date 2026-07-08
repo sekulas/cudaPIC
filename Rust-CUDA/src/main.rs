@@ -366,7 +366,7 @@ mod kernels {
         efield:   &[Real],
         mut x:    DisjointSlice<Real>,
         mut vx:   DisjointSlice<Real>,
-        n_active: u32,
+        n_active: &[u32],
         factor:   Real,
         dt:       Real,
     ) {
@@ -387,7 +387,7 @@ mod kernels {
 
         if let Some((x_val, idx)) = x.get_mut_indexed() {
             let i = idx.get();
-            if i >= n_active as usize {
+            if i >= n_active[0] as usize {
                 return;
             }
 
@@ -413,13 +413,13 @@ mod kernels {
         efield:   &[Real],
         mut x:    DisjointSlice<Real>,
         mut vx:   DisjointSlice<Real>,
-        n_active: u32,
+        n_active: &[u32],
         factor:   Real,
         dt:       Real,
     ) {
         if let Some((x_val, idx)) = x.get_mut_indexed() {
             let i = idx.get();
-            if i >= n_active as usize {
+            if i >= n_active[0] as usize {
                 return;
             }
             if let Some(vx_val) = vx.get_mut(idx) {
@@ -440,7 +440,7 @@ mod kernels {
     pub fn get_density(
         x:             &[Real],
         density:       &[Real],
-        n_active:      u32,
+        n_active:      &[u32],
     ) {
         static mut LOCAL_DENSITY: SharedArray<Real, N_G> = SharedArray::UNINIT;
 
@@ -456,7 +456,7 @@ mod kernels {
 
         // Charge to shared histogram | Block-scope atomics
         let i = thread::index_1d().get();
-        if i < n_active as usize {
+        if i < n_active[0] as usize {
             let pos = x[i] * INV_DX as Real;
             let q   = pos as usize;
             let rem  = pos - q as Real;
@@ -630,7 +630,7 @@ mod kernels {
         mut dst_vy: DisjointSlice<Real>,
         mut dst_vz: DisjointSlice<Real>,
         alive_counter: &[u32],   // global alive count (MUST BE zeroed before launch)
-        n_active:      u32,
+        n_active:      &[u32],
     ) {
         static mut SCAN_SMEM: SharedArray<u32, COMPACT_NUM_WARPS> = SharedArray::UNINIT;
         static mut BASE_S:    SharedArray<u32, 1>                 = SharedArray::UNINIT;
@@ -641,7 +641,7 @@ mod kernels {
         let i     = thread::index_1d().get();
 
         let mut flag: u32 = 0;
-        if i < n_active as usize {
+        if i < n_active[0] as usize {
             let xi = src_x[i];
             if xi >= 0.0 as Real && xi <= L as Real {
                 flag = 1;
@@ -1553,13 +1553,13 @@ fn main() {
 
             gpu.e_density.zero_async(&stream).expect("Failed to zero e_density");
             module.get_density(&stream, cfg_e,
-                &gpu.e_x, &gpu.e_density, n_e,
+                &gpu.e_x, &gpu.e_density, &gpu.n_electrons,
             ).expect("get_density (electrons) failed");
 
             if t % N_SUB == 0 {
                 gpu.i_density.zero_async(&stream).expect("Failed to zero i_density");
                 module.get_density(&stream, cfg_i,
-                    &gpu.i_x, &gpu.i_density, n_i,
+                    &gpu.i_x, &gpu.i_density, &gpu.n_ions,
                 ).expect("get_density (ions) failed");
             }
 
@@ -1570,46 +1570,41 @@ fn main() {
 
             module.move_particles(&stream, cfg_e,
                 &gpu.efield, &mut gpu.e_x, &mut gpu.e_vx,
-                n_e, FACTOR_E as Real, DT_E as Real,
+                &gpu.n_electrons, FACTOR_E as Real, DT_E as Real,
             ).expect("move_particles (electrons) failed");
 
             if t % N_SUB == 0 {
                 module.move_particles(&stream, cfg_i,
                     &gpu.efield, &mut gpu.i_x, &mut gpu.i_vx,
-                    n_i, FACTOR_I as Real, DT_I as Real,
+                    &gpu.n_ions, FACTOR_I as Real, DT_I as Real,
                 ).expect("move_particles (ions) failed");
             }
 
-            gpu.alive_counter.zero_async(&stream).expect("Failed to zero alive_counter");
+            gpu.alive_counter.zero_async(&stream).expect("failed to zero alive_counter");
             module.check_boundaries_compact(&stream, cfg_e,
                 &gpu.e_x, &gpu.e_vx, &gpu.e_vy, &gpu.e_vz,
                 &mut gpu.tmp_x, &mut gpu.tmp_vx, &mut gpu.tmp_vy, &mut gpu.tmp_vz,
-                &gpu.alive_counter, n_e,
+                &gpu.alive_counter, &gpu.n_electrons,
             ).expect("check_boundaries (electrons) failed");
             std::mem::swap(&mut gpu.e_x,  &mut gpu.tmp_x);
             std::mem::swap(&mut gpu.e_vx, &mut gpu.tmp_vx);
             std::mem::swap(&mut gpu.e_vy, &mut gpu.tmp_vy);
             std::mem::swap(&mut gpu.e_vz, &mut gpu.tmp_vz);
-            n_e = gpu.alive_counter.to_host_vec(&stream).unwrap()[0];
+            gpu.n_electrons.copy_from_device_async(&gpu.alive_counter, &stream).expect("failed to copy alive_counter to n_electrons");
 
             if t % N_SUB == 0 {
-                unsafe {
-                    gpu.alive_counter.zero_async(&stream).expect("Failed to zero alive_counter");
-                }
+                gpu.alive_counter.zero_async(&stream).expect("failed to zero alive_counter");
                 module.check_boundaries_compact(&stream, cfg_i,
                     &gpu.i_x, &gpu.i_vx, &gpu.i_vy, &gpu.i_vz,
                     &mut gpu.tmp_x, &mut gpu.tmp_vx, &mut gpu.tmp_vy, &mut gpu.tmp_vz,
-                    &gpu.alive_counter, n_i,
+                    &gpu.alive_counter, &gpu.n_ions,
                 ).expect("check_boundaries (ions) failed");
                 std::mem::swap(&mut gpu.i_x,  &mut gpu.tmp_x);
                 std::mem::swap(&mut gpu.i_vx, &mut gpu.tmp_vx);
                 std::mem::swap(&mut gpu.i_vy, &mut gpu.tmp_vy);
                 std::mem::swap(&mut gpu.i_vz, &mut gpu.tmp_vz);
-                n_i = gpu.alive_counter.to_host_vec(&stream).unwrap()[0];
+                gpu.n_ions.copy_from_device_async(&gpu.alive_counter, &stream).expect("failed to copy alive_counter to n_ions");
             }
-
-            gpu.n_electrons = DeviceBuffer::from_host(&stream, &[n_e]).unwrap();
-            gpu.n_ions      = DeviceBuffer::from_host(&stream, &[n_i]).unwrap();
 
             module.check_collisions_e(&stream, cfg_e,
                 &gpu.sigma_tot_e, &gpu.cs, &gpu.n_electrons,
@@ -1687,11 +1682,12 @@ fn test_move_particles_analytic() {
     let efield_dev  = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
     let mut x_dev   = DeviceBuffer::from_host(&stream, &x_host).unwrap();
     let mut vx_dev  = DeviceBuffer::from_host(&stream, &vx_host).unwrap();
+    let amount = DeviceBuffer::from_host(&stream, &[n as u32]).unwrap();
     let module = kernels::load(&ctx).unwrap();
     let cfg    = LaunchConfig::for_num_elems(n as u32);
     module.move_particles(&stream, cfg,
         &efield_dev, &mut x_dev, &mut vx_dev,
-        n as u32, FACTOR_E as Real, DT_E as Real,
+        &amount, FACTOR_E as Real, DT_E as Real,
     ).unwrap();
 
     let x_gpu  = x_dev.to_host_vec(&stream).unwrap();
@@ -1756,9 +1752,10 @@ fn test_move_particles_edge_cases() {
     let mut vx_dev  = DeviceBuffer::from_host(&stream, &vx_cases).unwrap();
     let module = kernels::load(&ctx).unwrap();
     let cfg    = LaunchConfig::for_num_elems(n as u32);
+    let amount = DeviceBuffer::from_host(&stream, &[n as u32]).unwrap();
     module.move_particles(&stream, cfg,
         &efield_dev, &mut x_dev, &mut vx_dev,
-        n as u32, FACTOR_E as Real, DT_E as Real,
+        &amount, FACTOR_E as Real, DT_E as Real,
     ).unwrap();
 
     let x_gpu  = x_dev.to_host_vec(&stream).unwrap();
@@ -1813,9 +1810,10 @@ fn test_move_particles() {
     let mut vx_dev = DeviceBuffer::from_host(&stream, &vx_host).unwrap();
     let module = kernels::load(&ctx).unwrap();
     let cfg = LaunchConfig::for_num_elems(n_test as u32);
+    let amount = DeviceBuffer::from_host(&stream, &[n_test as u32]).unwrap();
     module.move_particles(&stream, cfg,
         &efield_dev, &mut x_dev, &mut vx_dev,
-        n_test as u32,
+        &amount,
         FACTOR_E as Real,
         DT_E as Real,
     ).unwrap();
@@ -1865,6 +1863,7 @@ fn bench_shmem_vs_no_shmem() {
     let mut vx_no_shmem  = DeviceBuffer::from_host(&stream, &vx_init).unwrap();
 
     let factor = FACTOR_E as Real;
+    let amount = DeviceBuffer::from_host(&stream, &[N as u32]).unwrap();
     
     // dt = 0 freezes positions across launches so particles never leave [0, L].
     let dt = 0.0 as Real;
@@ -1872,9 +1871,9 @@ fn bench_shmem_vs_no_shmem() {
     // warm-up (avoids JIT / driver overhead in measurements) TODO - verify if needed
     for _ in 0..10 {
         module.move_particles(&stream, cfg,
-            &efield_dev, &mut x_shmem, &mut vx_shmem, N as u32, factor, dt).unwrap();
+            &efield_dev, &mut x_shmem, &mut vx_shmem, &amount, factor, dt).unwrap();
         module.OLD_move_particles(&stream, cfg,
-            &efield_dev, &mut x_no_shmem, &mut vx_no_shmem, N as u32, factor, dt).unwrap();
+            &efield_dev, &mut x_no_shmem, &mut vx_no_shmem, &amount, factor, dt).unwrap();
     }
     ctx.synchronize().unwrap();
 
@@ -1882,7 +1881,7 @@ fn bench_shmem_vs_no_shmem() {
     let t0 = Instant::now();
     for _ in 0..REPS {
         module.move_particles(&stream, cfg,
-            &efield_dev, &mut x_shmem, &mut vx_shmem, N as u32, factor, dt).unwrap();
+            &efield_dev, &mut x_shmem, &mut vx_shmem, &amount, factor, dt).unwrap();
     }
     ctx.synchronize().unwrap();
     let t_shmem = t0.elapsed().as_secs_f64() / REPS as f64 * 1e6; // µs per launch
@@ -1891,7 +1890,7 @@ fn bench_shmem_vs_no_shmem() {
     let t0 = Instant::now();
     for _ in 0..REPS {
         module.OLD_move_particles(&stream, cfg,
-            &efield_dev, &mut x_no_shmem, &mut vx_no_shmem, N as u32, factor, dt).unwrap();
+            &efield_dev, &mut x_no_shmem, &mut vx_no_shmem, &amount, factor, dt).unwrap();
     }
     ctx.synchronize().unwrap();
     let t_no_shmem = t0.elapsed().as_secs_f64() / REPS as f64 * 1e6;
@@ -1912,10 +1911,11 @@ fn run_deposit_on_gpu(x_host: &[Real]) -> Vec<Real> {
     let density_dev = DeviceBuffer::<Real>::zeroed(&stream, N_G).unwrap();
 
     let cfg_deposit = LaunchConfig::for_num_elems(x_host.len() as u32);
+    let amount = DeviceBuffer::from_host(&stream, &[x_host.len() as u32]).unwrap();
 
     module.get_density(
         &stream, cfg_deposit,
-        &x_dev, &density_dev, x_host.len() as u32,
+        &x_dev, &density_dev, &amount,
     ).unwrap();
 
     density_dev.to_host_vec(&stream).unwrap()
@@ -2034,13 +2034,14 @@ fn run_check_boundaries(
     let mut dst_vz = DeviceBuffer::<Real>::zeroed(&stream, n).unwrap();
 
     let alive   = DeviceBuffer::from_host(&stream, &[0u32]).unwrap();
+    let amount  = DeviceBuffer::from_host(&stream, &[n as u32]).unwrap();
 
     let cfg = LaunchConfig::for_num_elems(n as u32);
     module.check_boundaries_compact(
         &stream, cfg,
         &src_x, &src_vx, &src_vy, &src_vz,
         &mut dst_x, &mut dst_vx, &mut dst_vy, &mut dst_vz,
-        &alive, n as u32,
+        &alive, &amount,
     ).unwrap();
 
     let n_alive = alive.to_host_vec(&stream).unwrap()[0];
