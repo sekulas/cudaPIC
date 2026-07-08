@@ -1546,11 +1546,11 @@ fn main() {
     n_e_history.push(n_e);
     n_i_history.push(n_i);
 
+    let cfg_e = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
+    let cfg_i = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
+
     for cycle in 0..num_cycles {
         for t in 0..N_T {
-            let cfg_e = LaunchConfig::for_num_elems(n_e);
-            let cfg_i = LaunchConfig::for_num_elems(n_i);
-
             gpu.e_density.zero_async(&stream).expect("Failed to zero e_density");
             module.get_density(&stream, cfg_e,
                 &gpu.e_x, &gpu.e_density, &gpu.n_electrons,
@@ -1613,9 +1613,6 @@ fn main() {
                 &mut gpu.i_x, &mut gpu.i_vx, &mut gpu.i_vy, &mut gpu.i_vz,
                 &gpu.n_ions,
             ).expect("check_collisions_e failed");
-
-            n_e = gpu.n_electrons.to_host_vec(&stream).unwrap()[0];
-            n_i = gpu.n_ions.to_host_vec(&stream).unwrap()[0];
 
             if t % N_SUB == 0 {
                 module.check_collisions_i(&stream, cfg_i,
