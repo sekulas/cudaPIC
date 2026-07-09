@@ -362,7 +362,7 @@ mod kernels {
     use super::*;
 
     #[kernel]
-    pub fn move_particles(
+    pub fn OLD_move_particles(
         efield:   &[Real],
         mut x:    DisjointSlice<Real>,
         mut vx:   DisjointSlice<Real>,
@@ -409,7 +409,7 @@ mod kernels {
 
     // TODO - no shmem perf testing
     #[kernel]
-    pub fn OLD_move_particles(
+    pub fn move_particles(
         efield:   &[Real],
         mut x:    DisjointSlice<Real>,
         mut vx:   DisjointSlice<Real>,
