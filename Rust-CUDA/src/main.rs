@@ -671,6 +671,74 @@ mod kernels {
         }
     }
 
+    // fused move_particles + check_boundaries_compact kernel.
+    #[kernel]
+    pub fn move_and_compact(
+        efield:   &[Real],
+        src_x:    &[Real],
+        src_vx:   &[Real],
+        src_vy:   &[Real],
+        src_vz:   &[Real],
+        mut dst_x:  DisjointSlice<Real>,
+        mut dst_vx: DisjointSlice<Real>,
+        mut dst_vy: DisjointSlice<Real>,
+        mut dst_vz: DisjointSlice<Real>,
+        alive_counter: &[u32],   // global alive count (MUST be zeroed before launch)
+        n_active:      &[u32],
+        factor:   Real,
+        dt:       Real,
+    ) {
+        static mut SCAN_SMEM: SharedArray<u32, COMPACT_NUM_WARPS> = SharedArray::UNINIT;
+        static mut BASE_S:    SharedArray<u32, 1>                 = SharedArray::UNINIT;
+
+        let block = this_thread_block();
+        let tid   = thread::threadIdx_x() as usize;
+        let bdim  = thread::blockDim_x()  as usize;
+        let i     = thread::index_1d().get();
+
+        let mut flag: u32 = 0;
+        let mut new_x:  Real = 0.0;
+        let mut new_vx: Real = 0.0;
+
+        if i < n_active[0] as usize {
+            let xi  = src_x[i];
+            let vxi = src_vx[i];
+
+            let pos = xi * INV_DX as Real;
+            let p   = pos as usize;
+            let c2  = pos - p as Real;
+            let e_x = (1.0 as Real - c2) * efield[p]
+                    + c2 * efield[p + 1];
+
+            new_vx = vxi + factor * e_x;
+            new_x  = xi  + new_vx * dt;
+
+            if new_x >= 0.0 as Real && new_x <= L as Real {
+                flag = 1;
+            }
+        }
+
+        let incl = block_scan::<u32, Sum, _>(&block, flag, &raw mut SCAN_SMEM);
+
+        if tid == bdim - 1 {
+            let g    = unsafe { DeviceAtomicU32::from_ptr(alive_counter.as_ptr() as *mut u32) };
+            let base = g.fetch_add(incl, AtomicOrdering::Relaxed);
+            unsafe { BASE_S[0] = base; }
+        }
+        thread::sync_threads();
+
+        if flag == 1 {
+            let base = unsafe { BASE_S[0] };
+            let slot = base as usize + incl as usize - 1;
+            unsafe {
+                *dst_x.get_unchecked_mut(slot)  = new_x;
+                *dst_vx.get_unchecked_mut(slot) = new_vx;
+                *dst_vy.get_unchecked_mut(slot) = src_vy[i];
+                *dst_vz.get_unchecked_mut(slot) = src_vz[i];
+            }
+        }
+    }
+
     /// testing: flexible Double-Prefix-Sum Poisson solver for convergence testing
     /// solves ψ[i-1] - 2ψ[i] + ψ[i+1] = f[i] where f[i] = dx²·source[i].
     /// outputs only potential (no E-field) since convergence test needs only ψ.
@@ -1570,24 +1638,12 @@ fn main() {
                 &gpu.e_density, &gpu.i_density, &mut gpu.pot, &mut gpu.efield, pot0,
             ).expect("solve_poisson failed");
 
-            module.move_particles(&stream, cfg_e,
-                &gpu.efield, &mut gpu.e_x, &mut gpu.e_vx,
-                &gpu.n_electrons, FACTOR_E as Real, DT_E as Real,
-            ).expect("move_particles (electrons) failed");
-
-            if t % N_SUB == 0 {
-                module.move_particles(&stream, cfg_i,
-                    &gpu.efield, &mut gpu.i_x, &mut gpu.i_vx,
-                    &gpu.n_ions, FACTOR_I as Real, DT_I as Real,
-                ).expect("move_particles (ions) failed");
-            }
-
             gpu.alive_counter.zero_async(&stream).expect("failed to zero alive_counter");
-            module.check_boundaries_compact(&stream, cfg_e,
+            module.move_and_compact(&stream, cfg_e, &gpu.efield,
                 &gpu.e_x, &gpu.e_vx, &gpu.e_vy, &gpu.e_vz,
                 &mut gpu.tmp_x, &mut gpu.tmp_vx, &mut gpu.tmp_vy, &mut gpu.tmp_vz,
-                &gpu.alive_counter, &gpu.n_electrons,
-            ).expect("check_boundaries (electrons) failed");
+                &gpu.alive_counter, &gpu.n_electrons, FACTOR_E as Real, DT_E as Real
+            ).expect("move_and_compact (electrons) failed");
             std::mem::swap(&mut gpu.e_x,  &mut gpu.tmp_x);
             std::mem::swap(&mut gpu.e_vx, &mut gpu.tmp_vx);
             std::mem::swap(&mut gpu.e_vy, &mut gpu.tmp_vy);
@@ -1596,11 +1652,11 @@ fn main() {
 
             if t % N_SUB == 0 {
                 gpu.alive_counter.zero_async(&stream).expect("failed to zero alive_counter");
-                module.check_boundaries_compact(&stream, cfg_i,
+                module.move_and_compact(&stream, cfg_i, &gpu.efield,
                     &gpu.i_x, &gpu.i_vx, &gpu.i_vy, &gpu.i_vz,
                     &mut gpu.tmp_x, &mut gpu.tmp_vx, &mut gpu.tmp_vy, &mut gpu.tmp_vz,
-                    &gpu.alive_counter, &gpu.n_ions,
-                ).expect("check_boundaries (ions) failed");
+                    &gpu.alive_counter, &gpu.n_ions,  FACTOR_I as Real, DT_I as Real
+                ).expect("move_and_compact (ions) failed");
                 std::mem::swap(&mut gpu.i_x,  &mut gpu.tmp_x);
                 std::mem::swap(&mut gpu.i_vx, &mut gpu.tmp_vx);
                 std::mem::swap(&mut gpu.i_vy, &mut gpu.tmp_vy);
