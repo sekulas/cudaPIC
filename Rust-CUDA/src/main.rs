@@ -265,12 +265,12 @@ impl GpuSimState {
         particles: &ParticlesSoA,
         n_active: u32,
     ) -> Result<(), cuda_core::DriverError> {
-        self.e_x  = DeviceBuffer::from_host(stream, &particles.x)?;
-        self.e_vx = DeviceBuffer::from_host(stream, &particles.vx)?;
-        self.e_vy = DeviceBuffer::from_host(stream, &particles.vy)?;
-        self.e_vz = DeviceBuffer::from_host(stream, &particles.vz)?;
+        self.e_x.copy_from_host(stream, &particles.x)?;
+        self.e_vx.copy_from_host(stream, &particles.vx)?;
+        self.e_vy.copy_from_host(stream, &particles.vy)?;
+        self.e_vz.copy_from_host(stream, &particles.vz)?;
 
-        self.n_electrons = DeviceBuffer::from_host(stream, &[n_active])?;
+        self.n_electrons.copy_from_host(stream, &[n_active])?;
         Ok(())
     }
 
@@ -280,12 +280,12 @@ impl GpuSimState {
         particles: &ParticlesSoA,
         n_active: u32,
     ) -> Result<(), cuda_core::DriverError> {
-        self.i_x  = DeviceBuffer::from_host(stream, &particles.x)?;
-        self.i_vx = DeviceBuffer::from_host(stream, &particles.vx)?;
-        self.i_vy = DeviceBuffer::from_host(stream, &particles.vy)?;
-        self.i_vz = DeviceBuffer::from_host(stream, &particles.vz)?;
+        self.i_x.copy_from_host(stream, &particles.x)?;
+        self.i_vx.copy_from_host(stream, &particles.vx)?;
+        self.i_vy.copy_from_host(stream, &particles.vy)?;
+        self.i_vz.copy_from_host(stream, &particles.vz)?;
 
-        self.n_ions = DeviceBuffer::from_host(stream, &[n_active])?;
+        self.n_ions.copy_from_host(stream, &[n_active])?;
         Ok(())
     }
 
@@ -297,9 +297,9 @@ impl GpuSimState {
         sigma_tot_e: &[Real],    // [CS_RANGES]
         sigma_tot_i: &[Real],    // [CS_RANGES]
     ) -> Result<(), cuda_core::DriverError> {
-        self.cs          = DeviceBuffer::from_host(stream, cs_flat)?;
-        self.sigma_tot_e = DeviceBuffer::from_host(stream, sigma_tot_e)?;
-        self.sigma_tot_i = DeviceBuffer::from_host(stream, sigma_tot_i)?;
+        self.cs.copy_from_host(stream, cs_flat)?;
+        self.sigma_tot_e.copy_from_host(stream, sigma_tot_e)?;
+        self.sigma_tot_i.copy_from_host(stream, sigma_tot_i)?;
         Ok(())
     }
 
@@ -314,15 +314,15 @@ impl GpuSimState {
             core::array::from_fn(|k| src.iter().map(|s| s[k]).collect())
         }
         let [s0, s1, s2, s3] = split(e_seeds);
-        self.rng_e0 = DeviceBuffer::from_host(stream, &s0)?;
-        self.rng_e1 = DeviceBuffer::from_host(stream, &s1)?;
-        self.rng_e2 = DeviceBuffer::from_host(stream, &s2)?;
-        self.rng_e3 = DeviceBuffer::from_host(stream, &s3)?;
+        self.rng_e0.copy_from_host(stream, &s0)?;
+        self.rng_e1.copy_from_host(stream, &s1)?;
+        self.rng_e2.copy_from_host(stream, &s2)?;
+        self.rng_e3.copy_from_host(stream, &s3)?;
         let [s0, s1, s2, s3] = split(i_seeds);
-        self.rng_i0 = DeviceBuffer::from_host(stream, &s0)?;
-        self.rng_i1 = DeviceBuffer::from_host(stream, &s1)?;
-        self.rng_i2 = DeviceBuffer::from_host(stream, &s2)?;
-        self.rng_i3 = DeviceBuffer::from_host(stream, &s3)?;
+        self.rng_i0.copy_from_host(stream, &s0)?;
+        self.rng_i1.copy_from_host(stream, &s1)?;
+        self.rng_i2.copy_from_host(stream, &s2)?;
+        self.rng_i3.copy_from_host(stream, &s3)?;
         Ok(())
     }
 
