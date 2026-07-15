@@ -3,3 +3,4 @@ target/
 *.ll
 *.ptx
 results/
+*.nsys-rep

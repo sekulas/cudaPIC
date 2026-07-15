@@ -1086,18 +1086,17 @@ mod kernels {
     }
 
     #[kernel]
-    pub fn check_collisions_e(total_cs_e: &[Real], cs: &[Real], n_active: &[u32], 
+    pub fn check_collisions_e(total_cs_e: &[Real], cs: &[Real], active_e: &[u32], 
                         mut x: DisjointSlice<Real>, mut vx: DisjointSlice<Real>, mut vy: DisjointSlice<Real>, mut vz: DisjointSlice<Real>, 
                         mut rng0: DisjointSlice<u32>, mut rng1: DisjointSlice<u32>, mut rng2: DisjointSlice<u32>, mut rng3: DisjointSlice<u32>,
                         mut i_x: DisjointSlice<Real>, mut i_vx: DisjointSlice<Real>, mut i_vy: DisjointSlice<Real>, mut i_vz: DisjointSlice<Real>,
-                        n_ions: &[u32]) {
+                        alive_e: &[u32], alive_i: &[u32]) {
         let i = thread::index_1d().get();
-        if i >= n_active[0] as usize { 
+        if i >= active_e[0] as usize {
             return;
         } 
 
         let v2 = unsafe { *vx.get_unchecked_mut(i) * *vx.get_unchecked_mut(i) + *vy.get_unchecked_mut(i) * *vy.get_unchecked_mut(i) + *vz.get_unchecked_mut(i) * *vz.get_unchecked_mut(i) };
-        let velocity: Real = ptx_sqrt(v2);
         let energy: Real = HALF_E_MASS_OVER_E_CHARGE * v2; // EV_TO_J
         let c1 = (energy / (DE_CS as Real) + 0.5) as usize;
         let c2 = CS_RANGES - 1;
@@ -1106,6 +1105,7 @@ mod kernels {
         let nu: Real = if PRECOMPUTE_COLLISION_FREQ {
             total_cs_e[energy_index]
         } else {
+            let velocity: Real = ptx_sqrt(v2);
             total_cs_e[energy_index] * velocity
         };
 
@@ -1113,8 +1113,8 @@ mod kernels {
         
         let p_coll: Real = 1.0 - ptx_exp(-nu * DT_E as Real);
         if rand_val < p_coll {
-            collision_e(cs, &mut x, &mut vx, &mut vy, &mut vz, i, energy_index, n_active, &mut rng0, &mut rng1, &mut rng2, &mut rng3,
-                       &mut i_x, &mut i_vx, &mut i_vy, &mut i_vz, n_ions);
+            collision_e(cs, &mut x, &mut vx, &mut vy, &mut vz, i, energy_index, &mut rng0, &mut rng1, &mut rng2, &mut rng3,
+                       &mut i_x, &mut i_vx, &mut i_vy, &mut i_vz, alive_e, alive_i);
         }
         
     }
@@ -1122,8 +1122,8 @@ mod kernels {
     // TODO - options(may_diverge) sprawdź dla inline ptx.
 
     pub fn collision_e(cs: &[Real], x: &mut DisjointSlice<Real>, vx: &mut DisjointSlice<Real>, vy: &mut DisjointSlice<Real>, vz: &mut DisjointSlice<Real>, i: usize, 
-                    energy_index: usize, n_active: &[u32], rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>,
-                    i_x: &mut DisjointSlice<Real>, i_vx: &mut DisjointSlice<Real>, i_vy: &mut DisjointSlice<Real>, i_vz: &mut DisjointSlice<Real>, n_ions: &[u32]) {
+                    energy_index: usize, rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>,
+                    i_x: &mut DisjointSlice<Real>, i_vx: &mut DisjointSlice<Real>, i_vy: &mut DisjointSlice<Real>, i_vz: &mut DisjointSlice<Real>, alive_e: &[u32], alive_i: &[u32]) {
         let mut gx: Real = unsafe { *vx.get_unchecked_mut(i) };
         let mut gy: Real = unsafe { *vy.get_unchecked_mut(i) };
         let mut gz: Real = unsafe { *vz.get_unchecked_mut(i) };
@@ -1192,7 +1192,7 @@ mod kernels {
             gy = g_new * (st * cp * cc + ct * cp * sc * ce - sp * sc * se);
             gz = g_new * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
             
-            let n_alive = unsafe { &*(n_active.as_ptr() as *const DeviceAtomicU32) };
+            let n_alive = unsafe { &*(alive_e.as_ptr() as *const DeviceAtomicU32) };
             let idx = n_alive.fetch_add(1, AtomicOrdering::Relaxed);
             unsafe {
                 *x.get_unchecked_mut(idx as usize) = *x.get_unchecked_mut(i);
@@ -1201,7 +1201,7 @@ mod kernels {
                 *vz.get_unchecked_mut(idx as usize) = wz + F2 * gz;
             }
             
-            let n_ions_alive = unsafe { &*(n_ions.as_ptr() as *const DeviceAtomicU32) };
+            let n_ions_alive = unsafe { &*(alive_i.as_ptr() as *const DeviceAtomicU32) };
             let ion_idx = n_ions_alive.fetch_add(1, AtomicOrdering::Relaxed);
             unsafe {
                 *i_x.get_unchecked_mut(ion_idx as usize) = *x.get_unchecked_mut(i);
@@ -1230,7 +1230,7 @@ mod kernels {
     pub fn check_collisions_i(
         total_cs_i: &[Real],
         cs: &[Real],
-        n_active: &[u32],
+        active_i: &[u32],
         mut vx: DisjointSlice<Real>,
         mut vy: DisjointSlice<Real>,
         mut vz: DisjointSlice<Real>,
@@ -1240,7 +1240,7 @@ mod kernels {
         mut rng3: DisjointSlice<u32>,
     ) {
         let i = thread::index_1d().get();
-        if i >= n_active[0] as usize {
+        if i >= active_i[0] as usize {
             return;
         }
 
@@ -1250,7 +1250,6 @@ mod kernels {
         let gy = unsafe { *vy.get_unchecked_mut(i) } - vya;
         let gz = unsafe { *vz.get_unchecked_mut(i) } - vza;
         let g2 = gx * gx + gy * gy + gz * gz;
-        let g = ptx_sqrt(g2);
 
         let energy: Real = HALF_MU_ARAR_OVER_E_CHARGE * g2;
         let c1 = (energy / (DE_CS as Real) + 0.5) as usize;
@@ -1260,6 +1259,7 @@ mod kernels {
         let nu: Real = if PRECOMPUTE_COLLISION_FREQ { // TODO - can be removed if we do the choice
             total_cs_i[energy_index]
         } else {
+            let g = ptx_sqrt(g2);
             total_cs_i[energy_index] * g
         };
 
@@ -1664,13 +1664,16 @@ fn main() {
                 gpu.n_ions.copy_from_device_async(&gpu.alive_counter, &stream).expect("failed to copy alive_counter to n_ions");
             }
 
+            gpu.alive_counter.copy_from_device_async(&gpu.n_electrons, &stream).expect("failed to copy n_electrons to alive_counter");
             module.check_collisions_e(&stream, cfg_e,
                 &gpu.sigma_tot_e, &gpu.cs, &gpu.n_electrons,
                 &mut gpu.e_x, &mut gpu.e_vx, &mut gpu.e_vy, &mut gpu.e_vz,
                 &mut gpu.rng_e0, &mut gpu.rng_e1, &mut gpu.rng_e2, &mut gpu.rng_e3,
                 &mut gpu.i_x, &mut gpu.i_vx, &mut gpu.i_vy, &mut gpu.i_vz,
-                &gpu.n_ions,
+                &gpu.alive_counter, &gpu.n_ions,
             ).expect("check_collisions_e failed");
+            gpu.n_electrons.copy_from_device_async(&gpu.alive_counter, &stream).expect("failed to copy alive_counter to n_electrons");
+
 
             if t % N_SUB == 0 {
                 module.check_collisions_i(&stream, cfg_i,
