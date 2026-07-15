@@ -502,7 +502,6 @@ mod kernels {
         pot0:       f32,
     ) {
         static mut SCAN_SMEM: SharedArray<f32, SCAN_NUM_WARPS> = SharedArray::UNINIT;
-        static mut H_S:       SharedArray<f32, N_G>            = SharedArray::UNINIT;
         static mut POT_S:     SharedArray<f32, N_G>            = SharedArray::UNINIT;
         static mut TOTAL_S:   SharedArray<f32, 1>              = SharedArray::UNINIT;
 
@@ -524,24 +523,11 @@ mod kernels {
 
         let s_i = block_scan::<f32, Sum, _>(&block, g_i, &raw mut SCAN_SMEM);
 
-        let h_i: f32 = if tid == 0 || tid >= N_G {
-            0.0f32
-        } else {
-            -s_i / (tid as f32 + 1.0f32)
-        };
-
-        if tid < N_G {
-            unsafe { H_S[tid] = h_i; }
-        }
-
-
-        thread::sync_threads();
-
-
         let r_i: f32 = if tid == 0 || tid >= N_G - 1 {
             0.0f32
         } else {
-            unsafe { H_S[tid] / (tid as f32) }
+            let h_i = -s_i / (tid as f32 + 1.0f32);
+            h_i / (tid as f32)
         };
 
         let big_r_i = block_scan::<f32, Sum, _>(&block, r_i, &raw mut SCAN_SMEM);
