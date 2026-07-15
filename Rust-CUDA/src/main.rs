@@ -529,6 +529,8 @@ mod kernels {
 
         let s_i = block_scan::<f32, Sum, _>(&block, g_i, &raw mut SCAN_SMEM);
 
+        thread::sync_threads();
+
         let r_i: f32 = if tid == 0 || tid >= N_G - 1 {
             0.0f32
         } else {
@@ -562,26 +564,6 @@ mod kernels {
 
         thread::sync_threads();
 
-
-        // if tid < N_G {
-        //     let pk = unsafe { POT_S[tid] };
-        //     unsafe { *pot.get_unchecked_mut(tid) = pk; }
-
-        //     let e_i = if tid == 0 {
-        //         let rho0 = E_CHARGE_F * (i_density[0] - e_density[0]);
-        //         let pk1  = unsafe { POT_S[1] };
-        //         (pk - pk1) * INV_DX_F - rho0 * HALF_DX_OVER_EPS_F
-        //     } else if tid == N_G - 1 {
-        //         let rho_n = E_CHARGE_F * (i_density[N_G - 1] - e_density[N_G - 1]);
-        //         let pkm1  = unsafe { POT_S[N_G - 2] };
-        //         (pkm1 - pk) * INV_DX_F + rho_n * HALF_DX_OVER_EPS_F
-        //     } else {
-        //         let pkm1 = unsafe { POT_S[tid - 1] };
-        //         let pkp1 = unsafe { POT_S[tid + 1] };
-        //         0.5f32 * (pkm1 - pkp1) * INV_DX_F
-        //     };
-        //     unsafe { *efield.get_unchecked_mut(tid) = e_i; }
-        // }
         if let Some((pot_elem, idx)) = pot.get_mut_indexed() {
             let pk = unsafe { POT_S[tid] };
             *pot_elem = pk;
