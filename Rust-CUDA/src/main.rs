@@ -120,6 +120,7 @@ const LOG2_E: Real = 1.4426950408889634; // log2(e)
 // precomputed
 const HALF_E_MASS_OVER_E_CHARGE: Real = (0.5 * E_MASS / E_CHARGE) as Real;
 const HALF_MU_ARAR_OVER_E_CHARGE: Real = (0.5 * MU_ARAR / E_CHARGE) as Real;
+const HALF_INV_DX_F: Real = (0.5 * INV_DX) as Real;
 
 // SoA particle data - host-side representation
 
@@ -513,10 +514,15 @@ mod kernels {
         let tid   = thread::threadIdx_x() as usize;
         let block = this_thread_block();
 
+        let rho_i = if tid < N_G {
+            E_CHARGE_F * (i_density[tid] - e_density[tid])
+        } else {
+            0.0f32
+        };
+
         let g_i: f32 = if tid == 0 || tid >= N_G {
             0.0f32
         } else {
-            let rho_i = E_CHARGE_F * (i_density[tid] - e_density[tid]);
             let f_i   = ALPHA_F * rho_i - if tid == 1 { pot0 } else { 0.0f32 };
             (tid as f32) * f_i
         };
@@ -581,17 +587,15 @@ mod kernels {
             *pot_elem = pk;
 
             let e_i = if tid == 0 {
-                let rho0 = E_CHARGE_F * (i_density[0] - e_density[0]);
                 let pk1  = unsafe { POT_S[1] };
-                (pk - pk1) * INV_DX_F - rho0 * HALF_DX_OVER_EPS_F
+                (pk - pk1) * INV_DX_F - rho_i * HALF_DX_OVER_EPS_F
             } else if tid == N_G - 1 {
-                let rho_n = E_CHARGE_F * (i_density[N_G - 1] - e_density[N_G - 1]);
                 let pkm1  = unsafe { POT_S[N_G - 2] };
-                (pkm1 - pk) * INV_DX_F + rho_n * HALF_DX_OVER_EPS_F
+                (pkm1 - pk) * INV_DX_F + rho_i * HALF_DX_OVER_EPS_F
             } else {
                 let pkm1 = unsafe { POT_S[tid - 1] };
                 let pkp1 = unsafe { POT_S[tid + 1] };
-                0.5f32 * (pkm1 - pkp1) * INV_DX_F
+                (pkm1 - pkp1) * HALF_INV_DX_F
             };
 
             if let Some(efield_elem) = efield.get_mut(idx) {
