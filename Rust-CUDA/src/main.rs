@@ -122,6 +122,12 @@ const HALF_E_MASS_OVER_E_CHARGE: Real = (0.5 * E_MASS / E_CHARGE) as Real;
 const HALF_MU_ARAR_OVER_E_CHARGE: Real = (0.5 * MU_ARAR / E_CHARGE) as Real;
 const HALF_INV_DX_F: Real = (0.5 * INV_DX) as Real;
 
+// poisson solver constants (f32 for kernel)
+const ALPHA_F: f32 = (-DX * DX / EPSILON0) as f32;
+const E_CHARGE_F: f32 = E_CHARGE as f32;
+const INV_DX_F: f32 = INV_DX as f32;
+const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32;
+
 // SoA particle data - host-side representation
 
 struct ParticlesSoA {                                // Host-side SoA container for particle data.
@@ -492,8 +498,6 @@ mod kernels {
     }
 
 
-    // Double-Prefix-Sum Poisson solver - f32 only.
-    // Launch: 1 block, SCAN_BLOCK_SIZE=512 threads (≥ N_G=400).
     #[kernel]
     pub fn solve_poisson_scan_f32(
         e_density:  &[f32],
@@ -504,12 +508,7 @@ mod kernels {
     ) {
         static mut SCAN_SMEM: SharedArray<f32, SCAN_NUM_WARPS> = SharedArray::UNINIT;
         static mut POT_S:     SharedArray<f32, N_G>            = SharedArray::UNINIT;
-        static mut TOTAL_S:   SharedArray<f32, 1>              = SharedArray::UNINIT;
-
-        const ALPHA_F: f32            = (-DX * DX / EPSILON0) as f32;
-        const E_CHARGE_F:    f32      = E_CHARGE as f32;
-        const INV_DX_F: f32           = INV_DX as f32;
-        const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32;
+        static mut R_TOTAL_S:   SharedArray<f32, 1>              = SharedArray::UNINIT;
 
         let tid   = thread::threadIdx_x() as usize;
         let block = this_thread_block();
@@ -527,32 +526,31 @@ mod kernels {
             (tid as f32) * f_i
         };
 
-        let s_i = block_scan::<f32, Sum, _>(&block, g_i, &raw mut SCAN_SMEM);
+        let big_g_i = block_scan::<f32, Sum, _>(&block, g_i, &raw mut SCAN_SMEM);
 
         thread::sync_threads();
 
         let r_i: f32 = if tid == 0 || tid >= N_G - 1 {
             0.0f32
         } else {
-            let h_i = -s_i / (tid as f32 + 1.0f32);
+            let h_i = -big_g_i / (tid as f32 + 1.0f32);
             h_i / (tid as f32)
         };
 
         let big_r_i = block_scan::<f32, Sum, _>(&block, r_i, &raw mut SCAN_SMEM);
 
         if tid == N_G - 2 {
-            unsafe { TOTAL_S[0] = big_r_i; }
+            unsafe { R_TOTAL_S[0] = big_r_i; }
         }
 
-
         thread::sync_threads();
-        let total = unsafe { TOTAL_S[0] };
+        let r_total = unsafe { R_TOTAL_S[0] };
 
 
         let pot_i: f32 = if tid == 0 {
             pot0
         } else if tid < N_G - 1 {
-            (tid as f32) * (total - big_r_i + r_i)
+            (tid as f32) * (r_total - big_r_i + r_i)
         } else {
             0.0f32 
         };
