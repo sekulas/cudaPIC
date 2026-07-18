@@ -968,14 +968,16 @@ mod kernels {
         (x << k) | (x >> (32 - k))
     }
 
-    fn xoshiro128p_next(s0: u32, s1: u32, s2: u32, s3: u32) -> (u32, u32, u32, u32, u32) {
+    fn xoshiro128p_next(mut s0: u32, mut s1: u32, mut s2: u32, mut s3: u32) -> (u32, u32, u32, u32, u32) {
         let result = s0 + s3;
         let t = s1 << 9;
-        let s2 = s2 ^ s0;
-        let s3 = s3 ^ s1;
-        let s1 = s1 ^ s2;
-        let s0 = s0 ^ s3;
-        let s2 = s2 ^ t;
+
+        s2 ^= s0;
+        s3 ^= s1;
+        s1 ^= s2;
+        s0 ^= s3;
+        s2 ^= t;
+        
         let s3 = rotl32(s3, 11);
         (result, s0, s1, s2, s3)
     }
