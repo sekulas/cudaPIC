@@ -128,6 +128,10 @@ const E_CHARGE_F: f32 = E_CHARGE as f32;
 const INV_DX_F: f32 = INV_DX as f32;
 const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32;
 
+// rng
+const RUN_SEED_E: u32 = 123456789;
+const RUN_SEED_I: u32 = 987654321;
+
 // SoA particle data - host-side representation
 
 struct ParticlesSoA {                                // Host-side SoA container for particle data.
@@ -191,16 +195,6 @@ struct GpuSimState {
     sigma_tot_e: DeviceBuffer<Real>,  // [CS_RANGES]
     sigma_tot_i: DeviceBuffer<Real>,  // [CS_RANGES]
 
-    // RNG state per-particle
-    rng_e0: DeviceBuffer<u32>,
-    rng_e1: DeviceBuffer<u32>,
-    rng_e2: DeviceBuffer<u32>,
-    rng_e3: DeviceBuffer<u32>,
-    rng_i0: DeviceBuffer<u32>,
-    rng_i1: DeviceBuffer<u32>,
-    rng_i2: DeviceBuffer<u32>,
-    rng_i3: DeviceBuffer<u32>,
-
     // double-buffer pattern for check_boundaries stream compaction
     tmp_x:  DeviceBuffer<Real>,
     tmp_vx: DeviceBuffer<Real>,
@@ -243,17 +237,6 @@ impl GpuSimState {
             // total cross sections
             sigma_tot_e: DeviceBuffer::<Real>::zeroed(stream, CS_RANGES)?,
             sigma_tot_i: DeviceBuffer::<Real>::zeroed(stream, CS_RANGES)?,
-
-            // RNG state: 4 × u32 per particle
-            // TODO xoshiro128+ - verify
-            rng_e0: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
-            rng_e1: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
-            rng_e2: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
-            rng_e3: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
-            rng_i0: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
-            rng_i1: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
-            rng_i2: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
-            rng_i3: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
 
             // tmp buffers for stream compaction
             tmp_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
@@ -307,29 +290,6 @@ impl GpuSimState {
         self.cs.copy_from_host(stream, cs_flat)?;
         self.sigma_tot_e.copy_from_host(stream, sigma_tot_e)?;
         self.sigma_tot_i.copy_from_host(stream, sigma_tot_i)?;
-        Ok(())
-    }
-
-    // upload RNG seeds
-    fn upload_rng_state(
-        &mut self,
-        stream: &cuda_core::CudaStream,
-        e_seeds: &[[u32; 4]],
-        i_seeds: &[[u32; 4]],
-    ) -> Result<(), cuda_core::DriverError> {
-        fn split(src: &[[u32; 4]]) -> [Vec<u32>; 4] {
-            core::array::from_fn(|k| src.iter().map(|s| s[k]).collect())
-        }
-        let [s0, s1, s2, s3] = split(e_seeds);
-        self.rng_e0.copy_from_host(stream, &s0)?;
-        self.rng_e1.copy_from_host(stream, &s1)?;
-        self.rng_e2.copy_from_host(stream, &s2)?;
-        self.rng_e3.copy_from_host(stream, &s3)?;
-        let [s0, s1, s2, s3] = split(i_seeds);
-        self.rng_i0.copy_from_host(stream, &s0)?;
-        self.rng_i1.copy_from_host(stream, &s1)?;
-        self.rng_i2.copy_from_host(stream, &s2)?;
-        self.rng_i3.copy_from_host(stream, &s3)?;
         Ok(())
     }
 
@@ -986,72 +946,113 @@ mod kernels {
         (f32::from_bits(0x3F80_0000u32 | (x >> 9)) - 1.0) as Real
     }
 
-    fn rng_next_f32(i: usize, rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>) -> Real {
-        let s0 = unsafe { *rng0.get_unchecked_mut(i) };
-        let s1 = unsafe { *rng1.get_unchecked_mut(i) };
-        let s2 = unsafe { *rng2.get_unchecked_mut(i) };
-        let s3 = unsafe { *rng3.get_unchecked_mut(i) };
-        let (result, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
-        unsafe {
-            *rng0.get_unchecked_mut(i) = ns0;
-            *rng1.get_unchecked_mut(i) = ns1;
-            *rng2.get_unchecked_mut(i) = ns2;
-            *rng3.get_unchecked_mut(i) = ns3;
-        }
-        u32_to_real(result)
+    const PHILOX_M4X32_0: u32 = 0xD251_1F53;
+    const PHILOX_M4X32_1: u32 = 0xCD9E_8D57;
+    const PHILOX_W32_0: u32 = 0x9E37_79B9; // stała Weyla (złoty podział)
+    const PHILOX_W32_1: u32 = 0xBB67_AE85; // stała Weyla (sqrt(3))
+
+    #[inline(always)]
+    fn mulhilo32(a: u32, b: u32) -> (u32, u32) {
+        let p = (a as u64) * (b as u64);
+        ((p >> 32) as u32, p as u32)
     }
 
-    fn rng_next_three_normal(
-        i: usize, 
-        sigma: Real, // standard deviation of the normal distribution
-        rng0: &mut DisjointSlice<u32>, 
-        rng1: &mut DisjointSlice<u32>, 
-        rng2: &mut DisjointSlice<u32>, 
-        rng3: &mut DisjointSlice<u32>
-    ) -> (Real, Real, Real) {
-        
-        let mut s0 = unsafe { *rng0.get_unchecked_mut(i) };
-        let mut s1 = unsafe { *rng1.get_unchecked_mut(i) };
-        let mut s2 = unsafe { *rng2.get_unchecked_mut(i) };
-        let mut s3 = unsafe { *rng3.get_unchecked_mut(i) };
+    #[inline(always)]
+    fn philox4x32_round(ctr: [u32; 4], key: [u32; 2]) -> [u32; 4] {
+        let (hi0, lo0) = mulhilo32(PHILOX_M4X32_0, ctr[0]);
+        let (hi1, lo1) = mulhilo32(PHILOX_M4X32_1, ctr[2]);
+        [hi1 ^ ctr[1] ^ key[0], lo1, hi0 ^ ctr[3] ^ key[1], lo0]
+    }
 
-        let (r1, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
-        s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
+    #[inline(always)]
+    fn philox4x32_bumpkey(key: [u32; 2]) -> [u32; 2] {
+        [key[0].wrapping_add(PHILOX_W32_0), key[1].wrapping_add(PHILOX_W32_1)]
+    }
 
-        let (r2, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
-        s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
+    // 10 rund — wariant walidowany TestU01 BigCrush/PractRand, używany
+    // domyślnie w cuRAND, Intel MKL, rocRAND, PyTorch/JAX.
+    #[inline(always)]
+    fn philox4x32_10(mut ctr: [u32; 4], mut key: [u32; 2]) -> [u32; 4] {
+        for _ in 0..9 {
+            ctr = philox4x32_round(ctr, key);
+            key = philox4x32_bumpkey(key);
+        }
+        philox4x32_round(ctr, key) // runda 10.
+    }
 
-        let (r3, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
-        s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
-
-        // fourth random for Box-Muller, but not used
-        let (r4, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
-        
+    fn philox_seed_particle(
+        i: usize,
+        particle_id: u32,
+        run_seed: u32,
+        rng0: &mut DisjointSlice<u32>,
+        rng1: &mut DisjointSlice<u32>,
+        rng2: &mut DisjointSlice<u32>,
+        rng3: &mut DisjointSlice<u32>,
+    ) {
         unsafe {
-            *rng0.get_unchecked_mut(i) = ns0;
-            *rng1.get_unchecked_mut(i) = ns1;
-            *rng2.get_unchecked_mut(i) = ns2;
-            *rng3.get_unchecked_mut(i) = ns3;
+            *rng0.get_unchecked_mut(i) = 0;
+            *rng1.get_unchecked_mut(i) = 0;
+            *rng2.get_unchecked_mut(i) = particle_id;
+            *rng3.get_unchecked_mut(i) = run_seed;
+        }
+    }
+
+    // PhiloxBuf: register-resident RNG state with 4-word output buffering.
+    // Loads counter + key from DRAM once, produces all random numbers in
+    // registers, stores only the counter back to DRAM at kernel end.
+    struct PhiloxBuf {
+        slot: u32,          // thread::index_1d(), stałe w obrębie wywołania
+        local_ctr: u32,     // startuje od 0, bumpowany TYLKO w rejestrach
+        t: u32,
+        cycle: u32,
+        k0: u32,            // RUN_SEED_E / RUN_SEED_I
+        buf: [u32; 4],
+        idx: u32,
+    }
+
+    impl PhiloxBuf {
+        #[inline(always)]
+        fn new(slot: u32, t: u32, cycle: u32, run_seed: u32) -> Self {
+            Self { slot, local_ctr: 0, t, cycle, k0: run_seed, buf: [0; 4], idx: 4 }
         }
 
-        let f1 = u32_to_real(r1);
-        let f2 = u32_to_real(r2);
-        let f3 = u32_to_real(r3);
-        let f4 = u32_to_real(r4);
-        let u1 = ptx_max(f1, 1e-9 as Real);
-        let u2 = ptx_max(f2, 1e-9 as Real);
-        let u3 = ptx_max(f3, 1e-9 as Real);
-        let u4 = ptx_max(f4, 1e-9 as Real);
+        #[inline(always)]
+        fn next_u32(&mut self) -> u32 {
+            if self.idx >= 4 {
+                self.buf = philox4x32_10(
+                    [self.slot, self.local_ctr, self.t, self.cycle],
+                    [self.k0, 0u32],
+                );
+                self.local_ctr = self.local_ctr.wrapping_add(1); // nigdy nie opuszcza rejestru
+                self.idx = 0;
+            }
+            let r = self.buf[self.idx as usize];
+            self.idx += 1;
+            r
+        }
+
+        #[inline(always)]
+        fn next_f32(&mut self) -> Real {
+            u32_to_real(self.next_u32())
+        }
+    }
+
+    fn rng_next_three_normal_reg(
+        rng: &mut PhiloxBuf,
+        sigma: Real,
+    ) -> (Real, Real, Real) {
+        let u1 = ptx_max(u32_to_real(rng.next_u32()), 1e-9 as Real);
+        let u2 = u32_to_real(rng.next_u32());
+        let u3 = ptx_max(u32_to_real(rng.next_u32()), 1e-9 as Real);
+        let u4 = u32_to_real(rng.next_u32());
 
         let rad1 = ptx_sqrt(-2.0 as Real * ptx_lg2(u1) * (1.0 / LOG2_E));
         let angle1 = TWO_PI as Real * u2;
-        
         let z0 = rad1 * ptx_cos(angle1);
         let z1 = rad1 * ptx_sin(angle1);
 
         let rad2 = ptx_sqrt(-2.0 as Real * ptx_lg2(u3) * (1.0 / LOG2_E));
         let angle2 = TWO_PI as Real * u4;
-        
         let z2 = rad2 * ptx_cos(angle2);
 
         (z0 * sigma, z1 * sigma, z2 * sigma)
@@ -1060,13 +1061,20 @@ mod kernels {
     #[kernel]
     pub fn check_collisions_e(total_cs_e: &[Real], cs: &[Real], active_e: &[u32], 
                         mut x: DisjointSlice<Real>, mut vx: DisjointSlice<Real>, mut vy: DisjointSlice<Real>, mut vz: DisjointSlice<Real>, 
-                        mut rng0: DisjointSlice<u32>, mut rng1: DisjointSlice<u32>, mut rng2: DisjointSlice<u32>, mut rng3: DisjointSlice<u32>,
                         mut i_x: DisjointSlice<Real>, mut i_vx: DisjointSlice<Real>, mut i_vy: DisjointSlice<Real>, mut i_vz: DisjointSlice<Real>,
-                        alive_e: &[u32], alive_i: &[u32]) {
+                        alive_e: &[u32], alive_i: &[u32], t: u32, cycle: u32) {
         let i = thread::index_1d().get();
         if i >= active_e[0] as usize {
             return;
         } 
+
+        // Load RNG state from DRAM → registers (ONCE)
+        let mut rng = PhiloxBuf::new(
+            i as u32,
+            t,
+            cycle,
+            RUN_SEED_E,
+        );
 
         let v2 = unsafe { *vx.get_unchecked_mut(i) * *vx.get_unchecked_mut(i) + *vy.get_unchecked_mut(i) * *vy.get_unchecked_mut(i) + *vz.get_unchecked_mut(i) * *vz.get_unchecked_mut(i) };
         let energy: Real = HALF_E_MASS_OVER_E_CHARGE * v2; // EV_TO_J
@@ -1081,20 +1089,19 @@ mod kernels {
             total_cs_e[energy_index] * velocity
         };
 
-        let rand_val = rng_next_f32(i, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+        let rand_val = rng.next_f32();
         
         let p_coll: Real = 1.0 - ptx_exp(-nu * DT_E as Real);
         if rand_val < p_coll {
-            collision_e(cs, &mut x, &mut vx, &mut vy, &mut vz, i, energy_index, &mut rng0, &mut rng1, &mut rng2, &mut rng3,
+            collision_e(cs, &mut x, &mut vx, &mut vy, &mut vz, i, energy_index, &mut rng,
                        &mut i_x, &mut i_vx, &mut i_vy, &mut i_vz, alive_e, alive_i);
         }
-        
     }
 
     // TODO - options(may_diverge) sprawdź dla inline ptx.
 
     pub fn collision_e(cs: &[Real], x: &mut DisjointSlice<Real>, vx: &mut DisjointSlice<Real>, vy: &mut DisjointSlice<Real>, vz: &mut DisjointSlice<Real>, i: usize, 
-                    energy_index: usize, rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>,
+                    energy_index: usize, rng: &mut PhiloxBuf,
                     i_x: &mut DisjointSlice<Real>, i_vx: &mut DisjointSlice<Real>, i_vy: &mut DisjointSlice<Real>, i_vz: &mut DisjointSlice<Real>, alive_e: &[u32], alive_i: &[u32]) {
         let mut gx: Real = unsafe { *vx.get_unchecked_mut(i) };
         let mut gy: Real = unsafe { *vy.get_unchecked_mut(i) };
@@ -1135,26 +1142,26 @@ mod kernels {
         let sp: Real = ptx_sin(phi);
         let cp: Real = ptx_cos(phi);
 
-        let rnd = rng_next_f32(i, rng0, rng1, rng2, rng3);
+        let rnd = rng.next_f32();
         if rnd < t0 / t2 {  // elastic scattering
-            chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
-            eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
+            chi = ptx_acos(1.0 - 2.0 * rng.next_f32());
+            eta = TWO_PI as Real * rng.next_f32();
         } else if rnd < t1 / t2 {  // excitation
             let mut energy = 0.5 * E_MASS as Real * g * g;
             energy = ptx_abs(energy - E_EXC_TH as Real * E_CHARGE as Real);
             g = ptx_sqrt(2.0 as Real * energy / E_MASS as Real);
-            chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
-            eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
+            chi = ptx_acos(1.0 - 2.0 * rng.next_f32());
+            eta = TWO_PI as Real * rng.next_f32();
         } else {  // ionization
             let mut energy = 0.5 * E_MASS as Real * g * g;
             energy = ptx_abs(energy - E_ION_TH as Real * E_CHARGE as Real);
-            let e_new = 10.0 as Real * ptx_tan(rng_next_f32(i, rng0, rng1, rng2, rng3) * ptx_atan(energy / E_CHARGE as Real/20.0)) * E_CHARGE as Real;
+            let e_new = 10.0 as Real * ptx_tan(rng.next_f32() * ptx_atan(energy / E_CHARGE as Real/20.0)) * E_CHARGE as Real;
             let e_orig = ptx_abs(energy - e_new);
             g = ptx_sqrt(2.0 as Real * e_orig / E_MASS as Real);
             let g_new: Real = ptx_sqrt(2.0 as Real * e_new / E_MASS as Real);
             chi = ptx_acos(ptx_sqrt(e_orig / energy));
             let chi_new: Real = ptx_acos(ptx_sqrt(e_new / energy));
-            eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
+            eta = TWO_PI as Real * rng.next_f32();
             let eta_new: Real = eta + PI as Real;
             sc = ptx_sin(chi_new);
             cc = ptx_cos(chi_new);
@@ -1206,17 +1213,23 @@ mod kernels {
         mut vx: DisjointSlice<Real>,
         mut vy: DisjointSlice<Real>,
         mut vz: DisjointSlice<Real>,
-        mut rng0: DisjointSlice<u32>,
-        mut rng1: DisjointSlice<u32>,
-        mut rng2: DisjointSlice<u32>,
-        mut rng3: DisjointSlice<u32>,
+        t: u32,
+        cycle: u32,
     ) {
         let i = thread::index_1d().get();
         if i >= active_i[0] as usize {
             return;
         }
 
-        let (vxa, vya, vza) = rng_next_three_normal(i, NORMAL_RANGE, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+        // Load RNG state from DRAM → registers (ONCE)
+        let mut rng = PhiloxBuf::new(
+            i as u32, // particle_id
+            t,
+            cycle,
+            RUN_SEED_I,
+        );
+
+        let (vxa, vya, vza) = rng_next_three_normal_reg(&mut rng, NORMAL_RANGE);
 
         let gx = unsafe { *vx.get_unchecked_mut(i) } - vxa;
         let gy = unsafe { *vy.get_unchecked_mut(i) } - vya;
@@ -1235,13 +1248,17 @@ mod kernels {
             total_cs_i[energy_index] * g
         };
 
-        let rand_val = rng_next_f32(i, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+        let rand_val = rng.next_f32();
         let p_coll: Real = 1.0 - ptx_exp(-nu * DT_I as Real);
         if rand_val < p_coll {
             collision_i(cs, &mut vx, &mut vy, &mut vz, i,
                         vxa, vya, vza, energy_index,
-                        &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+                        &mut rng);
         }
+
+        // Store RNG counter back to DRAM (ONCE) — key unchanged
+        // Store RNG counter back to DRAM (ONCE) — key unchanged
+        // (No longer needed as rng state is kept in registers)
     }
 
     pub fn collision_i(
@@ -1254,10 +1271,7 @@ mod kernels {
         vya: Real,
         vza: Real,
         energy_index: usize,
-        rng0: &mut DisjointSlice<u32>,
-        rng1: &mut DisjointSlice<u32>,
-        rng2: &mut DisjointSlice<u32>,
-        rng3: &mut DisjointSlice<u32>,
+        rng: &mut PhiloxBuf,
     ) {
         let t0: Real = cs[I_ISO * CS_RANGES + energy_index];
         let t1: Real = t0 + cs[I_BACK * CS_RANGES + energy_index];
@@ -1286,13 +1300,13 @@ mod kernels {
             phi = ptx_atan2(gz, gy);
         }
 
-        let rnd = rng_next_f32(i, rng0, rng1, rng2, rng3);
+        let rnd = rng.next_f32();
         if rnd < t0 / t1 {
-            chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
+            chi = ptx_acos(1.0 - 2.0 * rng.next_f32());
         } else {
             chi = PI as Real;
         }
-        let eta: Real = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
+        let eta: Real = TWO_PI as Real * rng.next_f32();
 
         let sc: Real = ptx_sin(chi);
         let cc: Real = ptx_cos(chi);
@@ -1400,55 +1414,6 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
 
     (cs_flat, sigma_tot_e, sigma_tot_i)
 }
-
-/// generate xoshiro128+ seed state for all particle slots.
-fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
-    debug_assert!(master_seed != [0, 0, 0, 0], "state should not be everywhere 0");
-
-    const JUMP: [u32; 4] = [0x8764000b, 0xf542d2d3, 0x6fa035c3, 0x77f2db5b];
-
-    fn rotl32(x: u32, k: u32) -> u32 { (x << k) | (x >> (32 - k)) }
-    fn next(s: &mut [u32; 4]) -> u32 {
-        let result = s[0] + s[3];
-
-        let t = s[1] << 9;
-
-        s[2] ^= s[0]; 
-        s[3] ^= s[1];
-        s[1] ^= s[2]; 
-        s[0] ^= s[3];
-
-        s[2] ^= t;    
-        
-        s[3] = rotl32(s[3], 11);
-
-        result
-    }
-    fn jump(s: &mut [u32; 4]) {
-        let mut acc = [0u32; 4];
-        for &word in JUMP.iter() {
-            for b in 0..32 {
-                if word & (1u32 << b) != 0 {
-                    acc[0] ^= s[0];
-                    acc[1] ^= s[1];
-                    acc[2] ^= s[2];
-                    acc[3] ^= s[3];
-                }
-                next(s);
-            }
-        }
-        *s = acc;
-    }
-
-    let mut state = master_seed;
-    let mut streams = Vec::with_capacity(n);
-    for _ in 0..n {
-        streams.push(state);
-        jump(&mut state);
-    }
-    streams
-}
-
 
 enum ParticleSpecies {
     Electrons = 0,
@@ -1560,11 +1525,6 @@ fn main() {
     gpu.upload_cross_sections(&stream, &cs_flat, &sigma_tot_e, &sigma_tot_i)
         .expect("Failed to upload cross-sections");
 
-    let e_seeds = xoshiro128_seed_streams([0x1234_5678, 0x1111_2222, 0x2222_3333, 0x3333_4444], MAX_PARTICLES);
-    let i_seeds = xoshiro128_seed_streams([0x4444_5555, 0x5555_6666, 0x6666_7777, 0x7777_8888], MAX_PARTICLES);
-    gpu.upload_rng_state(&stream, &e_seeds, &i_seeds)
-        .expect("Failed to upload RNG state");
-
     println!(">> eduPIC-GPU: data uploaded to GPU");
 
     // 6. Launch configs
@@ -1640,9 +1600,8 @@ fn main() {
             module.check_collisions_e(&stream, cfg_e,
                 &gpu.sigma_tot_e, &gpu.cs, &gpu.n_electrons,
                 &mut gpu.e_x, &mut gpu.e_vx, &mut gpu.e_vy, &mut gpu.e_vz,
-                &mut gpu.rng_e0, &mut gpu.rng_e1, &mut gpu.rng_e2, &mut gpu.rng_e3,
                 &mut gpu.i_x, &mut gpu.i_vx, &mut gpu.i_vy, &mut gpu.i_vz,
-                &gpu.alive_counter, &gpu.n_ions,
+                &gpu.alive_counter, &gpu.n_ions, t, cycle as u32
             ).expect("check_collisions_e failed");
             gpu.n_electrons.copy_from_device_async(&gpu.alive_counter, &stream).expect("failed to copy alive_counter to n_electrons");
 
@@ -1651,7 +1610,7 @@ fn main() {
                 module.check_collisions_i(&stream, cfg_i,
                     &gpu.sigma_tot_i, &gpu.cs, &gpu.n_ions,
                     &mut gpu.i_vx, &mut gpu.i_vy, &mut gpu.i_vz,
-                    &mut gpu.rng_i0, &mut gpu.rng_i1, &mut gpu.rng_i2, &mut gpu.rng_i3,
+                    t, cycle as u32
                 ).expect("check_collisions_i failed");
             }
         }

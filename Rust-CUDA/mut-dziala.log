@@ -1,0 +1,9 @@
+>> eduPIC-GPU: starting...
+>> eduPIC-GPU: cuda-oxide parallel PIC/MCC simulation
+>> eduPIC-GPU: CUDA context initialized
+>> eduPIC-GPU: cross-sections computed (1000000 entries per process)
+>> eduPIC-GPU: GPU memory allocated (~31.3 MB)
+>> eduPIC-GPU: data uploaded to GPU
+>> eduPIC-GPU: running 1700 cycles x4000 steps...
+   checkpoint at cycle 10: n_e=6118, n_i=9500
+   checkpoint at cycle 20: n_e=11713, n_i=15620
