@@ -1278,11 +1278,12 @@ mod kernels {
             
             let n_ions_alive = unsafe { &*(alive_i.as_ptr() as *const DeviceAtomicU32) };
             let ion_idx = n_ions_alive.fetch_add(1, AtomicOrdering::Relaxed);
+            let (vxa, vya, vza) = rng_next_three_normal(i, NORMAL_RANGE, rng0, rng1, rng2, rng3);
             unsafe {
                 *i_x.get_unchecked_mut(ion_idx as usize) = *x.get_unchecked_mut(i);
-                *i_vx.get_unchecked_mut(ion_idx as usize) = 0.0 as Real; // TODO - properly initialize ion v
-                *i_vy.get_unchecked_mut(ion_idx as usize) = 0.0 as Real;
-                *i_vz.get_unchecked_mut(ion_idx as usize) = 0.0 as Real;
+                *i_vx.get_unchecked_mut(ion_idx as usize) = vxa;
+                *i_vy.get_unchecked_mut(ion_idx as usize) = vya;
+                *i_vz.get_unchecked_mut(ion_idx as usize) = vza;
             }
         }
 
