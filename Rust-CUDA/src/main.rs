@@ -1738,9 +1738,9 @@ fn main() {
                 std::mem::swap(&mut gpu.i_vy, &mut gpu.tmp_vy);
                 std::mem::swap(&mut gpu.i_vz, &mut gpu.tmp_vz);
                 gpu.n_ions.copy_from_device_async(&gpu.alive_counter, &stream).expect("failed to copy alive_counter to n_ions");
+                gpu.alive_counter.copy_from_device_async(&gpu.n_electrons, &stream).expect("failed to copy n_electrons to alive_counter");
             }
 
-            gpu.alive_counter.copy_from_device_async(&gpu.n_electrons, &stream).expect("failed to copy n_electrons to alive_counter");
             module.check_collisions_e(&stream, cfg_e,
                 &gpu.sigma_tot_e, &gpu.cs, &gpu.n_electrons,
                 &mut gpu.e_x, &mut gpu.e_vx, &mut gpu.e_vy, &mut gpu.e_vz,
