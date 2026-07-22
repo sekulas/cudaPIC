@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use cuda_core::{memory, CudaContext, DeviceBuffer, PinnedHostBuffer, LaunchConfig};
-use cuda_device::{cuda_module, kernel, thread, ptx_asm, DisjointSlice, SharedArray};
+use cuda_device::{cuda_module, kernel, thread, ptx_asm, DisjointSlice, SharedArray, warp, gpu_assert};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicF32, DeviceAtomicF32, DeviceAtomicU32};
 use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
 use rand::RngExt;
@@ -622,7 +622,7 @@ mod kernels {
 
         if tid == bdim - 1 {
             let g    = unsafe { DeviceAtomicU32::from_ptr(alive_counter.as_ptr() as *mut u32) };
-            let base = g.fetch_add(incl, AtomicOrdering::Relaxed);
+            let base = if incl > 0 { g.fetch_add(incl, AtomicOrdering::Relaxed) } else { 0 };
             unsafe { BASE_S[0] = base; }
         }
 
@@ -643,7 +643,7 @@ mod kernels {
 
     // fused move_particles + check_boundaries_compact kernel.
     #[kernel]
-    pub fn move_and_compact(
+    pub fn OLD_move_and_compact(
         efield:   &[Real],
         src_x:    &[Real],
         src_vx:   &[Real],
@@ -705,6 +705,109 @@ mod kernels {
                 *dst_vx.get_unchecked_mut(slot) = new_vx;
                 *dst_vy.get_unchecked_mut(slot) = src_vy[i];
                 *dst_vz.get_unchecked_mut(slot) = src_vz[i];
+            }
+        }
+    }
+
+
+    #[kernel]
+    pub fn move_and_compact(
+        efield:   &[Real],
+        src_x:    &[Real],
+        src_vx:   &[Real],
+        src_vy:   &[Real],
+        src_vz:   &[Real],
+        mut dst_x:  DisjointSlice<Real>,
+        mut dst_vx: DisjointSlice<Real>,
+        mut dst_vy: DisjointSlice<Real>,
+        mut dst_vz: DisjointSlice<Real>,
+        alive_counter: &[u32],   // MUSI być zerowany przed launchem
+        n_active:      &[u32],
+        factor:   Real,
+        dt:       Real,
+    ) {        
+        static mut WARP_SUMS: SharedArray<u32, COMPACT_NUM_WARPS> = SharedArray::UNINIT;
+        static mut BASE_S:    SharedArray<u32, 1>                 = SharedArray::UNINIT;
+
+        let tid   = thread::threadIdx_x() as usize;
+        let bdim  = thread::blockDim_x()  as usize;
+        let i     = thread::index_1d().get();
+        let lane  = warp::lane_id();
+        let wid   = warp::warp_id() as usize;
+        let mut flag: bool = false;
+        let (mut new_x, mut new_vx, mut vyi, mut vzi): (Real, Real, Real, Real) =
+            (0.0, 0.0, 0.0, 0.0);
+
+        if i < n_active[0] as usize {
+            let xi  = src_x[i];
+            let vxi = src_vx[i];
+
+            let pos = xi * INV_DX as Real;
+            let p   = pos as usize;
+            let c2  = pos - p as Real;
+            let e_x = (1.0 as Real - c2) * efield[p] + c2 * efield[p + 1];
+
+            new_vx = vxi + factor * e_x;
+            new_x  = xi  + new_vx * dt;
+
+            if new_x >= 0.0 as Real && new_x <= L as Real {
+                flag = true;
+                vyi = src_vy[i];
+                vzi = src_vz[i];
+            }
+        }
+
+        let mask        = warp::ballot(flag);
+        let lane_offset = (mask & warp::lanemask_lt()).count_ones();
+        let warp_total  = mask.count_ones();
+
+        if lane == 0 {
+            unsafe { WARP_SUMS[wid] = warp_total; }
+        }
+        thread::sync_threads();
+        if wid == 0 {
+            let v: u32 = if (lane as usize) < COMPACT_NUM_WARPS 
+                            { unsafe { WARP_SUMS[lane as usize] } } 
+                         else 
+                            { 0 };
+
+            let mut val = v;
+            let mut offset = 1u32;
+            while offset < 32 {
+                let n = warp::shuffle_up(val, offset);
+                if lane >= offset {
+                    val += n;
+                }
+                offset *= 2;
+            }
+            let excl = val - v;
+
+            if (lane as usize) < COMPACT_NUM_WARPS {
+                unsafe { WARP_SUMS[lane as usize] = excl; } // exclusive
+            }
+
+            gpu_assert!(COMPACT_NUM_WARPS <= 32, "COMPACT_NUM_WARPS must be ≤ 32 for single-warp prefix scan");
+            if lane as usize == COMPACT_NUM_WARPS - 1 {
+                let total_block = val; // inclusive
+                let base = 
+                    if total_block > 0 {
+                        let g = unsafe { DeviceAtomicU32::from_ptr(alive_counter.as_ptr() as *mut u32) };
+                        g.fetch_add(total_block, AtomicOrdering::Relaxed)
+                    } else { 0 };
+                unsafe { BASE_S[0] = base; }
+            }
+        }
+        thread::sync_threads();
+
+        if flag {
+            let warp_base = unsafe { WARP_SUMS[wid] };
+            let base      = unsafe { BASE_S[0] };
+            let slot = base as usize + warp_base as usize + lane_offset as usize;
+            unsafe {
+                *dst_x.get_unchecked_mut(slot)  = new_x;
+                *dst_vx.get_unchecked_mut(slot) = new_vx;
+                *dst_vy.get_unchecked_mut(slot) = vyi;
+                *dst_vz.get_unchecked_mut(slot) = vzi;
             }
         }
     }
