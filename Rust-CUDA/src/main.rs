@@ -102,8 +102,8 @@ const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;    // leapfrog acceleration fac
 const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);
 
 // block must have ≥ N_G threads so each thread owns one grid point
-// Next multiple of 32 above N_G=400 is 416, but 512 is cleaner (2 warps of power-of-two).
-const SCAN_BLOCK_SIZE: u32   = 512;                             // 16 warps, covers N_G=400
+// next multiple of 32 above N_G=400 is 416
+const SCAN_BLOCK_SIZE: u32   = 416;                             // 13 warps, covers N_G=400
 const SCAN_NUM_WARPS:  usize = SCAN_BLOCK_SIZE as usize / 32;   
 
 // check_boundaries stream compaction: per-block prefix scan + 1 atomicAdd/block.
