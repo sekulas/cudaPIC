@@ -128,6 +128,11 @@ const E_CHARGE_F: f32 = E_CHARGE as f32;
 const INV_DX_F: f32 = INV_DX as f32;
 const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32;
 
+// measurments
+const MIN_X_F: Real = MIN_X as Real;
+const MAX_X_F: Real = MAX_X as Real;
+const DE_EEPF_F: Real = DE_EEPF as Real;
+
 // SoA particle data - host-side representation
 
 struct ParticlesSoA {                                // Host-side SoA container for particle data.
@@ -209,11 +214,16 @@ struct GpuSimState {
 
     // alive counter for stream compaction
     alive_counter: DeviceBuffer<u32>,
+
+    // measurments
+    cumul_e_density: DeviceBuffer<f32>, 
+    cumul_i_density: DeviceBuffer<f32>,
+    eepf_counts:     DeviceBuffer<u32>,
 }
 
 impl GpuSimState {
     // allocate all GPU buffers (zeroed)
-    fn allocate(stream: &cuda_core::CudaStream) -> Result<Self, cuda_core::DriverError> {
+    fn allocate(stream: &cuda_core::CudaStream, measure: bool) -> Result<Self, cuda_core::DriverError> {
         Ok(Self {
             // particle arrays
             e_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
@@ -261,6 +271,22 @@ impl GpuSimState {
             tmp_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             tmp_vz: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             alive_counter: DeviceBuffer::<u32>::zeroed(stream, 1)?,
+
+            cumul_e_density: if measure {
+                DeviceBuffer::<f32>::zeroed(stream, N_G)?
+            } else {
+                DeviceBuffer::<f32>::zeroed(stream, 0)?
+            },
+            cumul_i_density: if measure {
+                DeviceBuffer::<f32>::zeroed(stream, N_G)?
+            } else {
+                DeviceBuffer::<f32>::zeroed(stream, 0)?
+            },
+            eepf_counts: if measure {
+                DeviceBuffer::<u32>::zeroed(stream, N_EEPF)?
+            } else {
+                DeviceBuffer::<u32>::zeroed(stream, 0)?
+            },
         })
     }
 
@@ -359,6 +385,16 @@ impl GpuSimState {
         let n  = self.n_ions.to_host_vec(stream)?;
 
         Ok((ParticlesSoA { x, vx, vy, vz }, n[0]))
+    }
+
+    fn download_measurements(
+        &self,
+        stream: &cuda_core::CudaStream,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<u32>), cuda_core::DriverError> {
+        let e_dens = self.cumul_e_density.to_host_vec(stream)?;
+        let i_dens = self.cumul_i_density.to_host_vec(stream)?;
+        let eepf   = self.eepf_counts.to_host_vec(stream)?;
+        Ok((e_dens, i_dens, eepf))
     }
 }
 
@@ -1417,6 +1453,56 @@ mod kernels {
             *vz.get_unchecked_mut(i) = wz + 0.5 * gz;
         }
     }
+
+    #[kernel]
+    pub fn accumulate_density(
+        density: &[Real],
+        mut cumul: DisjointSlice<f32>,
+    ) {
+        if let Some((c, idx)) = cumul.get_mut_indexed() {
+            *c += density[idx.get()];
+        }
+    }
+
+    #[kernel]
+    pub fn accumulate_eepf(
+        x:        &[Real],
+        vx:       &[Real],
+        vy:       &[Real],
+        vz:       &[Real],
+        efield:   &[Real],
+        active_e: &[u32],
+        mut eepf: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        if i >= active_e[0] as usize {
+            return;
+        }
+
+        let xi = x[i];
+        if xi <= MIN_X_F || xi >= MAX_X_F {
+            return;
+        }
+
+        let pos = xi * INV_DX as Real;
+        let p   = pos as usize;
+        let c2  = pos - p as Real;
+        let e_x = (1.0 as Real - c2) * efield[p] + c2 * efield[p + 1];
+
+        let mean_vx = vx[i] - 0.5 * e_x * (DT_E * E_CHARGE / E_MASS) as Real;
+        let vyi = vy[i];
+        let vzi = vz[i];
+
+        let v_sqr: Real = mean_vx * mean_vx + vyi * vyi + vzi * vzi;
+        let energy: Real = HALF_E_MASS_OVER_E_CHARGE * v_sqr;
+
+        let bin = (energy / DE_EEPF_F) as usize;
+        if bin < N_EEPF {
+            let elem = unsafe { eepf.get_unchecked_mut(bin) };
+            let a = unsafe { DeviceAtomicU32::from_ptr(elem as *mut u32) };
+            a.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
 }
 
 // Host-side initialization helpers
@@ -1582,10 +1668,10 @@ fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, spec
     fs::create_dir_all(&dir_path).expect("Unable to create directory");
     let filename = format!("{}/{:04}_{}_{}.csv", dir_path, step, time_stamp, species);
 
-    let mut file = File::create(&filename).expect("Unable to create file");
+    let mut file = File::create(&filename).expect("unable to create file");
     let mut writer = BufWriter::new(file);
     
-    writeln!(writer, "x,vx,vy,vz").expect("Unable to write header");
+    writeln!(writer, "x,vx,vy,vz").expect("unable to write header");
     
     for i in 0..amount {
         writeln!(
@@ -1593,7 +1679,7 @@ fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, spec
             "{},{},{},{}",
             particles.x[i], particles.vx[i], particles.vy[i], particles.vz[i]
         )
-        .expect("Unable to write particle data");
+        .expect("unable to write particle data");
     }
 }
 
@@ -1614,8 +1700,37 @@ fn save_particle_growth_data(n_e: Vec<u32>, n_i: Vec<u32>, tsmp: DateTime<Tz>) {
     }
 }
 
+fn save_density_avg(cumul_e: &[f32], cumul_i: &[f32], n_steps_e: f64, n_steps_i: f64, tsmp: DateTime<Tz>) {
+    let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
+    let dir_path = format!("results/{}", time_stamp);
+    fs::create_dir_all(&dir_path).expect("Unable to create directory");
+    let filename = format!("{}/density_avg_{}.csv", dir_path, time_stamp);
 
+    let mut file = File::create(&filename).expect("Unable to create file");
+    writeln!(file, "x,n_e,n_i").expect("header");
+    for k in 0..N_G {
+        let x = k as f32 * DX as f32;
+        writeln!(file, "{},{},{}", x, cumul_e[k] / n_steps_e as f32, cumul_i[k] / n_steps_i as f32)
+            .expect("row");
+    }
+}
 
+fn save_eepf(eepf_raw: &[u32], tsmp: DateTime<Tz>) {
+    let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
+    let dir_path = format!("results/{}", time_stamp);
+    fs::create_dir_all(&dir_path).expect("unable to create directory");
+    let filename = format!("{}/eepf_{}.csv", dir_path, time_stamp);
+
+    let h: f64 = eepf_raw.iter().map(|&c| c as f64).sum::<f64>() * DE_EEPF;
+
+    let mut file = File::create(&filename).expect("unable to create file");
+    writeln!(file, "energy_eV,eepf").expect("header");
+    for (i, &count) in eepf_raw.iter().enumerate() {
+        let e = (0.5 + i as f64) * DE_EEPF;           // center of the bin
+        let val = count as f64 / h / e.sqrt();
+        writeln!(file, "{},{}", e, val).expect("row");
+    }
+}
 
 fn main() {
     // perform_tests();
@@ -1624,10 +1739,17 @@ fn main() {
     println!(">> eduPIC-GPU: cuda-oxide parallel PIC/MCC simulation");
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: edupic-gpu <num_cycles>");
+        eprintln!("usage: edupic-gpu <num_cycles> [--measure] [last X measurement_cycles]");
         std::process::exit(1);
     }
-    let num_cycles: usize = args[1].parse().expect("Invalid cycle count");
+    let num_cycles: usize = args[1].parse().expect("invalid cycle count");
+    let measure: bool = args.get(2).map_or(false, |arg| arg == "--measure");
+    let measurement_cycles: usize = args.get(3)
+        .map(|s| s.parse().expect("invalid measurement_cycles"))
+        .unwrap_or(1);
+    let measurement_start_cycle = num_cycles.saturating_sub(measurement_cycles);
+    println!(">> eduPIC-GPU: num_cycles = {}, measure = {}, measurement_start_cycle = {}",
+        num_cycles, measure, measurement_start_cycle);
 
     let start = Instant::now();
 
@@ -1645,16 +1767,8 @@ fn main() {
     let ions_host      = init_particles(N_INIT);
 
     // 4. Allocate all GPU buffers
-    let mut gpu = GpuSimState::allocate(&stream)
-        .expect("Failed to allocate GPU memory");
-    println!(">> eduPIC-GPU: GPU memory allocated (~{:.1} MB)",
-        (MAX_PARTICLES * PARTICLE_COMPS * SIZEOF_REAL * N_SPECIES   // particles (e + i)
-        + N_CS * CS_RANGES * SIZEOF_REAL                            // cross sections
-        + CS_RANGES * SIZEOF_REAL * N_SPECIES                       // sigma_tot_e + sigma_tot_i
-        + N_G * N_GRID_ARRAYS * SIZEOF_REAL                         // grid arrays
-        + MAX_PARTICLES * 4 * 2                                     // RNG state (always u32)
-        ) as f64 / BYTES_PER_MB
-    );
+    let mut gpu = GpuSimState::allocate(&stream, measure)
+        .expect("failed to allocate GPU memory");
 
     // 5. Upload data to GPU (one-time PCIe transfer)
     gpu.upload_electrons(&stream, &electrons_host, N_INIT as u32)
@@ -1678,6 +1792,9 @@ fn main() {
         block_dim: (SCAN_BLOCK_SIZE, 1, 1),
         shared_mem_bytes: 0,
     };
+    let density_cfg = poisson_cfg; // one block
+    let eepf_cfg    = cfg;         // per particle
+
     let mut h_counter_e = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
     let mut h_counter_i = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
 
@@ -1695,7 +1812,15 @@ fn main() {
     let cfg_e = cfg;
     let cfg_i = cfg;
 
+    if measure {
+        gpu.cumul_e_density.zero_async(&stream).expect("zero cumul_e_density");
+        gpu.cumul_i_density.zero_async(&stream).expect("zero cumul_i_density");
+        gpu.eepf_counts.zero_async(&stream).expect("zero eepf_counts");
+    }
+
     for cycle in 0..num_cycles {
+        let in_measurement_window = measure && cycle >= measurement_start_cycle;
+
         for t in 0..N_T {
             gpu.e_density.zero_async(&stream).expect("Failed to zero e_density");
             module.get_density(&stream, cfg_e,
@@ -1713,6 +1838,18 @@ fn main() {
             module.solve_poisson_scan_f32(&stream, poisson_cfg,
                 &gpu.e_density, &gpu.i_density, &mut gpu.pot, &mut gpu.efield, pot0,
             ).expect("solve_poisson failed");
+
+            if in_measurement_window {
+                module.accumulate_density(&stream, density_cfg,
+                    &gpu.e_density, &mut gpu.cumul_e_density,
+                ).expect("accumulate_density (e) failed");
+
+                if t % N_SUB == 0 {
+                    module.accumulate_density(&stream, density_cfg,
+                        &gpu.i_density, &mut gpu.cumul_i_density,
+                    ).expect("accumulate_density (i) failed");
+                }
+            }
 
             gpu.alive_counter.zero_async(&stream).expect("failed to zero alive_counter");
             module.move_and_compact(&stream, cfg_e, &gpu.efield,
@@ -1750,13 +1887,19 @@ fn main() {
             ).expect("check_collisions_e failed");
             gpu.n_electrons.copy_from_device_async(&gpu.alive_counter, &stream).expect("failed to copy alive_counter to n_electrons");
 
-
             if t % N_SUB == 0 {
                 module.check_collisions_i(&stream, cfg_i,
                     &gpu.sigma_tot_i, &gpu.cs, &gpu.n_ions,
                     &mut gpu.i_vx, &mut gpu.i_vy, &mut gpu.i_vz,
                     &mut gpu.rng_i0, &mut gpu.rng_i1, &mut gpu.rng_i2, &mut gpu.rng_i3,
                 ).expect("check_collisions_i failed");
+            }
+
+            if in_measurement_window {
+                module.accumulate_eepf(&stream, eepf_cfg,
+                    &gpu.e_x, &gpu.e_vx, &gpu.e_vy, &gpu.e_vz,
+                    &gpu.efield, &gpu.n_electrons, &mut gpu.eepf_counts,
+                ).expect("accumulate_eepf failed");
             }
         }
 
@@ -1765,7 +1908,7 @@ fn main() {
                 .expect("copy_to_pinned_host_async n_electrons checkpoint failed");
             unsafe { gpu.n_ions.copy_to_pinned_host_async(&stream, &mut h_counter_i) }
                 .expect("copy_to_pinned_host_async n_ions checkpoint failed");
-                
+            
             stream.synchronize().unwrap();
 
             println!("   checkpoint at cycle {}: n_e={}, n_i={}", cycle + 1, h_counter_e[0], h_counter_i[0]);
@@ -1790,6 +1933,19 @@ fn main() {
     save_particle_data(&_electrons_result, n_e_final as usize, num_cycles, ParticleSpecies::Electrons, tsmp);
     save_particle_data(&_ions_result, n_i_final as usize, num_cycles, ParticleSpecies::Ions, tsmp);
     save_particle_growth_data(n_e_history, n_i_history, tsmp);
+
+    if measure {
+        let (cumul_e, cumul_i, eepf_raw) = gpu.download_measurements(&stream)
+            .expect("Failed to download measurements");
+
+        let n_steps_e = (measurement_cycles as f64 * N_T as f64) as f64;
+        let n_steps_i = (measurement_cycles as f64 * (N_T as f64 / N_SUB as f64)) as f64;
+
+        save_density_avg(&cumul_e, &cumul_i, n_steps_e, n_steps_i, tsmp);
+        save_eepf(&eepf_raw, tsmp);
+
+        println!(">> eduPIC-GPU: measurement data saved (density_avg, eepf) for {} cycles", measurement_cycles);
+    }
 }
 
 // tests
