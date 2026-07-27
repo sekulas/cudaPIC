@@ -1732,6 +1732,119 @@ fn save_eepf(eepf_raw: &[u32], tsmp: DateTime<Tz>) {
     }
 }
 
+
+fn save_info(
+    cumul_e: &[f32],           // accumulated electron density, downloaded to host [N_G]
+    eepf_raw: &[u32],          // accumulated EEPF histogram, downloaded to host [N_EEPF]
+    sigma_tot_e: &[Real],      // host-side total electron cross-section table [CS_RANGES] (pre-upload)
+    sigma_tot_i: &[Real],      // host-side total ion cross-section table [CS_RANGES] (pre-upload)
+    n_steps_e: f64,            // normalization used for cumul_e, i.e. measurement_cycles * N_T
+    num_cycles: usize,         // total cycles run in this invocation
+    measurement_cycles: usize, // cycles actually covered by the measurement window
+    tsmp: DateTime<Tz>,
+) -> bool {
+    let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
+    let dir_path = format!("results/{}", time_stamp);
+    fs::create_dir_all(&dir_path).expect("unable to create directory");
+    let filename = format!("{}/info_{}.txt", dir_path, time_stamp);
+    let mut file = File::create(&filename).expect("unable to create file");
+
+    let density: f64 = cumul_e[N_G / 2] as f64 / n_steps_e;               // e density @ center [m^-3]
+    let plas_freq: f64 = E_CHARGE * (density / EPSILON0 / E_MASS).sqrt(); // e plasma frequency @ center
+
+    let total_count: u64 = eepf_raw.iter().map(|&c| c as u64).sum();
+    let meane: f64 = if total_count > 0 {
+        let energy_sum: f64 = eepf_raw.iter().enumerate()
+            .map(|(i, &c)| (0.5 + i as f64) * DE_EEPF * c as f64)
+            .sum();
+        energy_sum / total_count as f64
+    } else {
+        0.0
+    };
+    let kT: f64 = 2.0 * meane * EV_TO_J / 3.0;                           // k T_e @ center (approximate)
+    let debye_length: f64 = (EPSILON0 * kT / density).sqrt() / E_CHARGE; // e Debye length @ center
+
+    let mut max_ecoll_freq: f64 = 0.0;
+    let mut max_icoll_freq: f64 = 0.0;
+    for i in 0..CS_RANGES {
+        let e: f64 = (i as f64) * DE_CS;
+        let se: f64 = sigma_tot_e[i] as f64;
+        let si: f64 = sigma_tot_i[i] as f64;
+
+        let nu_e = if PRECOMPUTE_COLLISION_FREQ {
+            se
+        } else {
+            (2.0 * e * EV_TO_J / E_MASS).sqrt() * se
+        };
+        if nu_e > max_ecoll_freq { max_ecoll_freq = nu_e; }
+
+        let nu_i = if PRECOMPUTE_COLLISION_FREQ {
+            si
+        } else {
+            (2.0 * e * EV_TO_J / MU_ARAR).sqrt() * si
+        };
+        if nu_i > max_icoll_freq { max_icoll_freq = nu_i; }
+    }
+
+    writeln!(file, "########################## eduPIC-GPU simulation report ########################").ok();
+    writeln!(file, "Simulation parameters:").ok();
+    writeln!(file, "Gap distance                          = {:1.6e} [m]",  L).ok();
+    writeln!(file, "# of grid divisions                   = {:10}",        N_G).ok();
+    writeln!(file, "Frequency                             = {:1.6e} [Hz]", FREQUENCY).ok();
+    writeln!(file, "# of time steps / period              = {:10}",        N_T).ok();
+    writeln!(file, "# of electron / ion time steps        = {:10}",        N_SUB).ok();
+    writeln!(file, "Voltage amplitude                     = {:1.6e} [V]",  VOLTAGE).ok();
+    writeln!(file, "Pressure (Ar)                         = {:1.6e} [Pa]", PRESSURE).ok();
+    writeln!(file, "Temperature                           = {:1.6e} [K]",  TEMPERATURE).ok();
+    writeln!(file, "Superparticle weight                  = {:1.6e} [m]",  WEIGHT).ok();
+    writeln!(file, "# of simulation cycles (total run)    = {:10}",        num_cycles).ok();
+    writeln!(file, "# of cycles in measurement window     = {:10}",        measurement_cycles).ok();
+    writeln!(file, "--------------------------------------------------------------------------------").ok();
+    writeln!(file, "Plasma characteristics:").ok();
+    writeln!(file, "Electron density @ center              = {:1.6e} [m^-3]",  density).ok();
+    writeln!(file, "Plasma frequency @ center              = {:1.6e} [rad/s]", plas_freq).ok();
+    writeln!(file, "Debye length @ center                  = {:1.6e} [m]",     debye_length).ok();
+    writeln!(file, "--------------------------------------------------------------------------------").ok();
+    writeln!(file, "Stability and accuracy conditions:").ok();
+
+    let mut conditions_ok = true;
+
+    let c1: f64 = plas_freq * DT_E;
+    writeln!(file, "Plasma frequency @ center * DT_E      = {:10.4} (OK if less than 0.20)", c1).ok();
+    if c1 > 0.2 { conditions_ok = false; }
+
+    let c2: f64 = DX / debye_length;
+    writeln!(file, "DX / Debye length @ center             = {:10.4} (OK if less than 1.00)", c2).ok();
+    if c2 > 1.0 { conditions_ok = false; }
+
+    let c3: f64 = max_ecoll_freq * DT_E;
+    writeln!(file, "Max. electron coll. frequency * DT_E  = {:10.4} (OK if less than 0.05)", c3).ok();
+    if c3 > 0.05 { conditions_ok = false; }
+
+    let c4: f64 = max_icoll_freq * DT_I;
+    writeln!(file, "Max. ion coll. frequency * DT_I       = {:10.4} (OK if less than 0.05)", c4).ok();
+    if c4 > 0.05 { conditions_ok = false; }
+
+    if !conditions_ok {
+        writeln!(file, "--------------------------------------------------------------------------------").ok();
+        writeln!(file, "** STABILITY AND ACCURACY CONDITION(S) VIOLATED - REFINE SIMULATION SETTINGS! **").ok();
+        writeln!(file, "--------------------------------------------------------------------------------").ok();
+    } else {
+        let v_max: f64 = DX / DT_E;
+        let e_max: f64 = 0.5 * E_MASS * v_max * v_max / EV_TO_J;
+        writeln!(file, "Max e- energy for CFL condition       = {:10.4} [eV]", e_max).ok();
+        writeln!(file, "Check EEPF to ensure that CFL is fulfilled for the majority of the electrons!").ok();
+        writeln!(file, "--------------------------------------------------------------------------------").ok();
+    }
+
+    writeln!(file, "Particle characteristics at the electrodes, and power absorption:").ok();
+    writeln!(file, "  not available in this build").ok();
+    writeln!(file, "--------------------------------------------------------------------------------\n").ok();
+
+    conditions_ok
+}
+
+
 fn main() {
     // perform_tests();
 
@@ -1944,7 +2057,17 @@ fn main() {
         save_density_avg(&cumul_e, &cumul_i, n_steps_e, n_steps_i, tsmp);
         save_eepf(&eepf_raw, tsmp);
 
-        println!(">> eduPIC-GPU: measurement data saved (density_avg, eepf) for {} cycles", measurement_cycles);
+        let conditions_ok = save_info(
+            &cumul_e, &eepf_raw, &sigma_tot_e, &sigma_tot_i,
+            n_steps_e, num_cycles, measurement_cycles, tsmp,
+        );
+        if !conditions_ok {
+            let ts = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
+            println!(">> eduPIC-GPU: ERROR = STABILITY AND ACCURACY CONDITION(S) VIOLATED!");
+            println!(">> eduPIC-GPU: see 'results/{}/info_{}.txt' and refine simulation settings!", ts, ts);
+        }
+
+        println!(">> eduPIC-GPU: measurement data saved (density_avg, eepf, info) for {} cycles", measurement_cycles);
     }
 }
 
