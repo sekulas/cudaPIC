@@ -1905,13 +1905,13 @@ fn main() {
         block_dim: (POISSON_SCAN_BLOCK_SIZE, 1, 1),
         shared_mem_bytes: 0,
     };
-    let density_cfg = poisson_cfg; // one block
     let mac_and_density_cfg = LaunchConfig {
         grid_dim: ((MAX_PARTICLES_U32.div_ceil(COMPACT_BLOCK_SIZE)), 1, 1),
         block_dim: (COMPACT_BLOCK_SIZE, 1, 1),
         shared_mem_bytes: 0,
     };
-    let eepf_cfg    = cfg;         // per particle
+    let acc_density_cfg = poisson_cfg;
+    let eepf_cfg    = cfg;         
 
     let mut h_counter_e = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
     let mut h_counter_i = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
@@ -1966,12 +1966,12 @@ fn main() {
             ).expect("solve_poisson failed");
 
             if in_measurement_window {
-                module.accumulate_density(&stream, density_cfg,
+                module.accumulate_density(&stream, acc_density_cfg,
                     &gpu.e_density, &mut gpu.cumul_e_density,
                 ).expect("accumulate_density (e) failed");
 
                 if t % N_SUB == 0 {
-                    module.accumulate_density(&stream, density_cfg,
+                    module.accumulate_density(&stream, acc_density_cfg,
                         &gpu.i_density, &mut gpu.cumul_i_density,
                     ).expect("accumulate_density (i) failed");
                 }
