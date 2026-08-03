@@ -107,9 +107,9 @@ const POISSON_SCAN_BLOCK_SIZE: u32   = 416;                             // 13 wa
 const POISSON_SCAN_NUM_WARPS:  usize = POISSON_SCAN_BLOCK_SIZE as usize / 32;   
 
 // check_boundaries stream compaction: per-block prefix scan + 1 atomicAdd/block.
-// Block size is fixed at 256 (8 warps) to match LaunchConfig::for_num_elems. TODO - verify
-const COMPACT_BLOCK_SIZE: u32   = 256;
-const COMPACT_NUM_WARPS:  usize = COMPACT_BLOCK_SIZE as usize / 32;   // = 8
+// Block size is fixed at 512 (16 warps)
+const COMPACT_BLOCK_SIZE: u32   = 512;
+const COMPACT_NUM_WARPS:  usize = COMPACT_BLOCK_SIZE as usize / 32;   // = 16
 
 // collisions
 const NORMAL_RANGE: Real = 269.90040554976775; // (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt();  // thermal velocity of background gas [m/s]
@@ -1906,6 +1906,11 @@ fn main() {
         shared_mem_bytes: 0,
     };
     let density_cfg = poisson_cfg; // one block
+    let mac_and_density_cfg = LaunchConfig {
+        grid_dim: ((MAX_PARTICLES_U32.div_ceil(COMPACT_BLOCK_SIZE)), 1, 1),
+        block_dim: (COMPACT_BLOCK_SIZE, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let eepf_cfg    = cfg;         // per particle
 
     let mut h_counter_e = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
@@ -1944,13 +1949,13 @@ fn main() {
 
         for t in 0..N_T {
             gpu.e_density.zero_async(&stream).expect("Failed to zero e_density");
-            module.get_density(&stream, cfg_e,
+            module.get_density(&stream, mac_and_density_cfg,
                 &gpu.e_x, &gpu.e_density, &gpu.n_electrons,
             ).expect("get_density (electrons) failed");
 
             if t % N_SUB == 0 {
                 gpu.i_density.zero_async(&stream).expect("Failed to zero i_density");
-                module.get_density(&stream, cfg_i,
+                module.get_density(&stream, mac_and_density_cfg,
                     &gpu.i_x, &gpu.i_density, &gpu.n_ions,
                 ).expect("get_density (ions) failed");
             }
@@ -1973,7 +1978,7 @@ fn main() {
             }
 
             gpu.alive_counter.zero_async(&stream).expect("failed to zero alive_counter");
-            module.move_and_compact(&stream, cfg_e, &gpu.efield,
+            module.move_and_compact(&stream, mac_and_density_cfg, &gpu.efield,
                 &gpu.e_x, &gpu.e_vx, &gpu.e_vy, &gpu.e_vz,
                 &mut gpu.tmp_x, &mut gpu.tmp_vx, &mut gpu.tmp_vy, &mut gpu.tmp_vz,
                 &gpu.alive_counter, &gpu.n_electrons, FACTOR_E as Real, DT_E as Real
@@ -1986,7 +1991,7 @@ fn main() {
 
             if t % N_SUB == 0 {
                 gpu.alive_counter.zero_async(&stream).expect("failed to zero alive_counter");
-                module.move_and_compact(&stream, cfg_i, &gpu.efield,
+                module.move_and_compact(&stream, mac_and_density_cfg, &gpu.efield,
                     &gpu.i_x, &gpu.i_vx, &gpu.i_vy, &gpu.i_vz,
                     &mut gpu.tmp_x, &mut gpu.tmp_vx, &mut gpu.tmp_vy, &mut gpu.tmp_vz,
                     &gpu.alive_counter, &gpu.n_ions,  FACTOR_I as Real, DT_I as Real
