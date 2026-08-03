@@ -103,8 +103,8 @@ const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);
 
 // block must have ≥ N_G threads so each thread owns one grid point
 // next multiple of 32 above N_G=400 is 416
-const SCAN_BLOCK_SIZE: u32   = 416;                             // 13 warps, covers N_G=400
-const SCAN_NUM_WARPS:  usize = SCAN_BLOCK_SIZE as usize / 32;   
+const POISSON_SCAN_BLOCK_SIZE: u32   = 416;                             // 13 warps, covers N_G=400
+const POISSON_SCAN_NUM_WARPS:  usize = POISSON_SCAN_BLOCK_SIZE as usize / 32;   
 
 // check_boundaries stream compaction: per-block prefix scan + 1 atomicAdd/block.
 // Block size is fixed at 256 (8 warps) to match LaunchConfig::for_num_elems. TODO - verify
@@ -542,7 +542,7 @@ mod kernels {
         mut efield: DisjointSlice<f32>,
         pot0:       f32,
     ) {
-        static mut SCAN_SMEM: SharedArray<f32, SCAN_NUM_WARPS> = SharedArray::UNINIT;
+        static mut SCAN_SMEM: SharedArray<f32, POISSON_SCAN_NUM_WARPS> = SharedArray::UNINIT;
         static mut POT_S:     SharedArray<f32, N_G>            = SharedArray::UNINIT;
         static mut R_TOTAL_S:   SharedArray<f32, 1>              = SharedArray::UNINIT;
 
@@ -1902,7 +1902,7 @@ fn main() {
     let cfg = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
     let poisson_cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
-        block_dim: (SCAN_BLOCK_SIZE, 1, 1),
+        block_dim: (POISSON_SCAN_BLOCK_SIZE, 1, 1),
         shared_mem_bytes: 0,
     };
     let density_cfg = poisson_cfg; // one block
@@ -1924,6 +1924,14 @@ fn main() {
 
     let cfg_e = cfg;
     let cfg_i = cfg;
+
+    match perform_checks() {
+        Ok(_) => println!(">> eduPIC-GPU: all checks passed"),
+        Err(e) => {
+            println!(">> eduPIC-GPU: check failed: {}", e);
+            std::process::exit(1);
+        }
+    }
 
     if measure {
         gpu.cumul_e_density.zero_async(&stream).expect("zero cumul_e_density");
@@ -2069,6 +2077,13 @@ fn main() {
 
         println!(">> eduPIC-GPU: measurement data saved (density_avg, eepf, info) for {} cycles", measurement_cycles);
     }
+}
+
+fn perform_checks() -> Result<(), Box<dyn std::error::Error>> {
+    if(POISSON_SCAN_BLOCK_SIZE < N_G as u32) {
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "POISSON_SCAN_BLOCK_SIZE must be >= N_G")));
+    }
+    Ok(())
 }
 
 // tests
