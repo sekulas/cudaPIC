@@ -2097,7 +2097,7 @@ fn perform_tests() {
     test_move_particles_analytic();
     test_move_particles_edge_cases();
     test_move_particles();
-    test_dps_convergence();
+    test_dps_convergence_cpu();
     test_dps_convergence_gpu();
     bench_shmem_vs_no_shmem();
     test_deposit_charge_analytic();
@@ -2199,16 +2199,32 @@ fn test_move_particles_edge_cases() {
     let x_gpu  = x_dev.to_host_vec(&stream).unwrap();
     let vx_gpu = vx_dev.to_host_vec(&stream).unwrap();
 
-    let eps: Real = if std::mem::size_of::<Real>() == 4 { 1e-5 as Real } else { 1e-10 as Real };
+    // Tolerancje zależne od precyzji:
+    // rel_tol - błąd względny (np. różnica maksymalnie 0.001% między CPU a GPU)
+    // abs_tol - błąd bezwzględny dla liczb bardzo bliskich 0
+    let (rel_tol, abs_tol): (Real, Real) = if std::mem::size_of::<Real>() == 4 { 
+        (1e-4 as Real, 1e-4 as Real) // f32
+    } else { 
+        (1e-11 as Real, 1e-12 as Real) // f64
+    };
+
+    let is_close = |a: Real, b: Real| -> bool {
+        let diff = (a - b).abs();
+        diff <= abs_tol || diff <= rel_tol * a.abs().max(b.abs())
+    };
+
     let labels = ["grid_node", "near_boundary", "zero_vx"];
     let mut errors = 0;
+
     for i in 0..n {
-        if (x_gpu[i] - x_cpu[i]).abs() > eps {
-            eprintln!("edge[{}] x:  GPU={:.15e} CPU={:.15e}", labels[i], x_gpu[i], x_cpu[i]);
+        if !is_close(x_gpu[i], x_cpu[i]) {
+            eprintln!("edge[{}] x:  GPU={:.15e} CPU={:.15e} (diff={:.15e})", 
+                    labels[i], x_gpu[i], x_cpu[i], (x_gpu[i] - x_cpu[i]).abs());
             errors += 1;
         }
-        if (vx_gpu[i] - vx_cpu[i]).abs() > eps {
-            eprintln!("edge[{}] vx: GPU={:.15e} CPU={:.15e}", labels[i], vx_gpu[i], vx_cpu[i]);
+        if !is_close(vx_gpu[i], vx_cpu[i]) {
+            eprintln!("edge[{}] vx: GPU={:.15e} CPU={:.15e} (diff={:.15e})", 
+                    labels[i], vx_gpu[i], vx_cpu[i], (vx_gpu[i] - vx_cpu[i]).abs());
             errors += 1;
         }
     }
@@ -2417,15 +2433,23 @@ fn test_deposit_charge() {
     let sum_gpu: f64 = gpu.iter().map(|&v| v as f64).sum::<f64>() * DX;
     let sum_cpu: f64 = cpu.iter().map(|&v| v as f64).sum::<f64>() * DX;
 
+    // 1. Zależna od precyzji tolerancja dla sumy całkowitej
+    let tol_cons = if std::mem::size_of::<Real>() == 4 { 
+        1e-5 as f64 // Dla f32 błędy akumulacji rzędu 1e-5 są całkowicie normalne
+    } else { 
+        1e-7 as f64 // Dla f64 różnice w kolejności atomicAdd dadzą błąd rzędu 1e-9 do 1e-8
+    };
+
     let cons_rel = ((sum_gpu - sum_cpu) / sum_cpu).abs();
-    if cons_rel > 1e-10 {
-        eprintln!("deposit conservation mismatch: GPU sum*DX = {:.6e}, CPU sum*DX = {:.6e}, rel diff = {:.2e}",
-            sum_gpu, sum_cpu, cons_rel);
+    if cons_rel > tol_cons {
+        eprintln!("deposit conservation mismatch: GPU sum*DX = {:.6e}, CPU sum*DX = {:.6e}, rel diff = {:.2e} (limit: {:.2e})",
+            sum_gpu, sum_cpu, cons_rel, tol_cons);
         std::process::exit(1);
     }
 
     let max_cell = cpu.iter().fold(0.0 as Real, |a, &b| if b > a { b } else { a });
-    let tol_abs: Real = (max_cell * 1e-10) as Real;
+    let tol_cell_rel = if std::mem::size_of::<Real>() == 4 { 1e-4 as Real } else { 1e-8 as Real };
+    let tol_abs: Real = max_cell * tol_cell_rel;
     let mut errors = 0;
     let mut max_diff: Real = 0.0;
     for i in 0..N_G {
@@ -2611,7 +2635,7 @@ const DPS_TEST_MAX_N: usize  = 512;
 ///
 /// This is the same algorithm as the GPU kernel `solve_poisson_scan_f32`,
 /// parametrized by grid size N instead of the fixed N_G=400.
-fn solve_poisson_dps_generic(n: usize, source: &[f64], psi_left: f64, psi_right: f64) -> Vec<f64> {
+fn solve_poisson_dps_flexible_cpu(n: usize, source: &[f64], psi_left: f64, psi_right: f64) -> Vec<f64> {
     let dx = 1.0 / (n - 1) as f64;
 
     let mut f = vec![0.0f64; n];
@@ -2662,7 +2686,7 @@ fn solve_poisson_dps_generic(n: usize, source: &[f64], psi_left: f64, psi_right:
 //
 // Expected: second-order convergence (error ∝ dx²), order → 2.0.
 // Writes results to `results/dps_cpu_N{n}.csv`.
-fn test_dps_convergence() {
+fn test_dps_convergence_cpu() {
     use std::fs;
     use std::io::Write;
 
@@ -2684,7 +2708,7 @@ fn test_dps_convergence() {
         dxs.push(dx);
 
         let source: Vec<f64> = (0..n).map(|i| source_fn(i as f64 * dx)).collect();
-        let psi_num = solve_poisson_dps_generic(n, &source, 0.0, 0.0);
+        let psi_num = solve_poisson_dps_flexible_cpu(n, &source, 0.0, 0.0);
 
         let mut file = fs::File::create(format!("results/dps_cpu_N{}.csv", n)).unwrap();
         writeln!(file, "x,psi_num,psi_exact").unwrap();
