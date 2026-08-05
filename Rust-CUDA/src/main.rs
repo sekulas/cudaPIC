@@ -216,8 +216,8 @@ struct GpuSimState {
     alive_counter: DeviceBuffer<u32>,
 
     // measurments
-    cumul_e_density: DeviceBuffer<f32>, 
-    cumul_i_density: DeviceBuffer<f32>,
+    cumul_e_density: DeviceBuffer<f64>, 
+    cumul_i_density: DeviceBuffer<f64>,
     eepf_counts:     DeviceBuffer<u32>,
 }
 
@@ -273,14 +273,14 @@ impl GpuSimState {
             alive_counter: DeviceBuffer::<u32>::zeroed(stream, 1)?,
 
             cumul_e_density: if measure {
-                DeviceBuffer::<f32>::zeroed(stream, N_G)?
+                DeviceBuffer::<f64>::zeroed(stream, N_G)?
             } else {
-                DeviceBuffer::<f32>::zeroed(stream, 0)?
+                DeviceBuffer::<f64>::zeroed(stream, 0)?
             },
             cumul_i_density: if measure {
-                DeviceBuffer::<f32>::zeroed(stream, N_G)?
+                DeviceBuffer::<f64>::zeroed(stream, N_G)?
             } else {
-                DeviceBuffer::<f32>::zeroed(stream, 0)?
+                DeviceBuffer::<f64>::zeroed(stream, 0)?
             },
             eepf_counts: if measure {
                 DeviceBuffer::<u32>::zeroed(stream, N_EEPF)?
@@ -390,7 +390,7 @@ impl GpuSimState {
     fn download_measurements(
         &self,
         stream: &cuda_core::CudaStream,
-    ) -> Result<(Vec<f32>, Vec<f32>, Vec<u32>), cuda_core::DriverError> {
+    ) -> Result<(Vec<f64>, Vec<f64>, Vec<u32>), cuda_core::DriverError> {
         let e_dens = self.cumul_e_density.to_host_vec(stream)?;
         let i_dens = self.cumul_i_density.to_host_vec(stream)?;
         let eepf   = self.eepf_counts.to_host_vec(stream)?;
@@ -1457,10 +1457,10 @@ mod kernels {
     #[kernel]
     pub fn accumulate_density(
         density: &[Real],
-        mut cumul: DisjointSlice<f32>,
+        mut cumul: DisjointSlice<f64>,
     ) {
         if let Some((c, idx)) = cumul.get_mut_indexed() {
-            *c += density[idx.get()];
+            *c += density[idx.get()] as f64;
         }
     }
 
@@ -1683,7 +1683,7 @@ fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, spec
     }
 }
 
-const CHECKPOINT_CYCLES: usize = 10;
+const CHECKPOINT_CYCLES: usize = 100;
 
 fn save_particle_growth_data(n_e: Vec<u32>, n_i: Vec<u32>, tsmp: DateTime<Tz>) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
@@ -1700,7 +1700,7 @@ fn save_particle_growth_data(n_e: Vec<u32>, n_i: Vec<u32>, tsmp: DateTime<Tz>) {
     }
 }
 
-fn save_density_avg(cumul_e: &[f32], cumul_i: &[f32], n_steps_e: f64, n_steps_i: f64, tsmp: DateTime<Tz>) {
+fn save_density_avg(cumul_e: &[f64], cumul_i: &[f64], n_steps_e: f64, n_steps_i: f64, tsmp: DateTime<Tz>) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
     let dir_path = format!("results/{}", time_stamp);
     fs::create_dir_all(&dir_path).expect("Unable to create directory");
@@ -1709,8 +1709,8 @@ fn save_density_avg(cumul_e: &[f32], cumul_i: &[f32], n_steps_e: f64, n_steps_i:
     let mut file = File::create(&filename).expect("Unable to create file");
     writeln!(file, "x,n_e,n_i").expect("header");
     for k in 0..N_G {
-        let x = k as f32 * DX as f32;
-        writeln!(file, "{},{},{}", x, cumul_e[k] / n_steps_e as f32, cumul_i[k] / n_steps_i as f32)
+        let x = k as f64 * DX as f64;
+        writeln!(file, "{},{},{}", x, cumul_e[k] / n_steps_e as f64, cumul_i[k] / n_steps_i as f64)
             .expect("row");
     }
 }
@@ -1734,7 +1734,7 @@ fn save_eepf(eepf_raw: &[u32], tsmp: DateTime<Tz>) {
 
 
 fn save_info(
-    cumul_e: &[f32],           // accumulated electron density, downloaded to host [N_G]
+    cumul_e: &[f64],           // accumulated electron density, downloaded to host [N_G]
     eepf_raw: &[u32],          // accumulated EEPF histogram, downloaded to host [N_EEPF]
     sigma_tot_e: &[Real],      // host-side total electron cross-section table [CS_RANGES] (pre-upload)
     sigma_tot_i: &[Real],      // host-side total ion cross-section table [CS_RANGES] (pre-upload)
@@ -2037,7 +2037,9 @@ fn main() {
             
             stream.synchronize().unwrap();
 
-            println!("   checkpoint at cycle {}: n_e={}, n_i={}", cycle + 1, h_counter_e[0], h_counter_i[0]);
+            println!("   checkpoint at cycle {}: n_e={}, n_i={}, time={:.3}s", cycle + 1, 
+                h_counter_e[0], h_counter_i[0], 
+                start.elapsed().as_secs_f64());
             n_e_history.push(h_counter_e[0]);
             n_i_history.push(h_counter_i[0]);
         }
