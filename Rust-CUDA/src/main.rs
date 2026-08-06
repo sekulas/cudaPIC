@@ -1864,8 +1864,7 @@ fn main() {
     println!(">> eduPIC-GPU: num_cycles = {}, measure = {}, measurement_start_cycle = {}",
         num_cycles, measure, measurement_start_cycle);
 
-    let start = Instant::now();
-
+    let start_init = Instant::now();
     // 1. Initialize CUDA context
     let ctx = CudaContext::new(0).expect("Failed to create CUDA context (no GPU?)");
     let stream = ctx.default_stream();
@@ -1944,6 +1943,10 @@ fn main() {
         gpu.eepf_counts.zero_async(&stream).expect("zero eepf_counts");
     }
 
+    println!("initialization time: {:.3} s", start_init.elapsed().as_secs_f64());
+
+    let start = Instant::now();
+    
     for cycle in 0..num_cycles {
         let in_measurement_window = measure && cycle >= measurement_start_cycle;
 
