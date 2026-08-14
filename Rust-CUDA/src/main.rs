@@ -91,12 +91,6 @@ const N_GRID_ARRAYS: usize    = 5;                    // efield, pot, rho, e_den
 const SIZEOF_REAL: usize      = std::mem::size_of::<Real>();  // adapts to Real precision
 const BYTES_PER_MB: f64       = 1_048_576.0;          // 1024 × 1024
 
-// cross section precomputation strategy:
-// TODO: verify true branch
-// - true:  sigma_tot = Σσ × v(E) × n_gas   - kernel just reads nu directly (no sqrt)
-// - false: sigma_tot = Σσ × n_gas          - kernel must compute v and multiply (like original eduPIC)
-const PRECOMPUTE_COLLISION_FREQ: bool = false;
-
 const FACTOR_E: f64 = DT_E / E_MASS * (-E_CHARGE);  // leapfrog acceleration factor for electrons [m/s per (V/m)]
 const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;    // leapfrog acceleration factor for ions [m/s per (V/m)]
 const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);
@@ -190,9 +184,8 @@ struct GpuSimState {
     // flattened 2D: cs[process][energy_index] → cs[process * CS_RANGES + energy_index]
     cs: DeviceBuffer<Real>,
 
-    // total cross sections for null-collision method.
-    // If PRECOMPUTE_COLLISION_FREQ: stores ν(E) = Σσ(E) × v(E) × n_gas  (kernel: nu = table[idx])
-    // If !PRECOMPUTE_COLLISION_FREQ: stores Σσ(E) × n_gas               (kernel: nu = table[idx] * v)
+    // total cross sections
+    // stores Σσ(E) × n_gas
     sigma_tot_e: DeviceBuffer<Real>,  // [CS_RANGES]
     sigma_tot_i: DeviceBuffer<Real>,  // [CS_RANGES]
 
@@ -1213,12 +1206,8 @@ mod kernels {
         let c2 = CS_RANGES - 1;
 
         let energy_index = c1.min(c2);
-        let nu: Real = if PRECOMPUTE_COLLISION_FREQ {
-            total_cs_e[energy_index]
-        } else {
-            let velocity: Real = ptx_sqrt(v2);
-            total_cs_e[energy_index] * velocity
-        };
+        let velocity: Real = ptx_sqrt(v2);
+        let nu: Real = total_cs_e[energy_index] * velocity;
 
         let rand_val = rng_next_f32(i, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
         
@@ -1367,13 +1356,8 @@ mod kernels {
         let c1 = (energy / (DE_CS as Real) + 0.5) as usize;
         let c2 = CS_RANGES - 1;
         let energy_index = c1.min(c2);
-
-        let nu: Real = if PRECOMPUTE_COLLISION_FREQ { // TODO - can be removed if we do the choice
-            total_cs_i[energy_index]
-        } else {
-            let g = ptx_sqrt(g2);
-            total_cs_i[energy_index] * g
-        };
+        let g = ptx_sqrt(g2);
+        let nu: Real = total_cs_i[energy_index] * g;
 
         let rand_val = rng_next_f32(i, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
         let p_coll: Real = 1.0 - ptx_exp(-nu * DT_I as Real);
@@ -1567,8 +1551,6 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
     }
 
     for i in 0..CS_RANGES {
-        let e = if i == 0 { DE_CS } else { (i as f64) * DE_CS };
-
         let sum_e = cs_flat[E_ELA * CS_RANGES + i] as f64
                   + cs_flat[E_EXC * CS_RANGES + i] as f64
                   + cs_flat[E_ION * CS_RANGES + i] as f64;
@@ -1576,16 +1558,8 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
         let sum_i = cs_flat[I_ISO * CS_RANGES + i] as f64
                   + cs_flat[I_BACK * CS_RANGES + i] as f64;
 
-        // TODO: verify true branch
-        if PRECOMPUTE_COLLISION_FREQ {
-            let v_e = (2.0 * e * EV_TO_J / E_MASS).sqrt();
-            let v_i = (2.0 * e * EV_TO_J / MU_ARAR).sqrt();
-            sigma_tot_e[i] = (sum_e * v_e * GAS_DENSITY) as Real;
-            sigma_tot_i[i] = (sum_i * v_i * GAS_DENSITY) as Real;
-        } else {
-            sigma_tot_e[i] = (sum_e * GAS_DENSITY) as Real;
-            sigma_tot_i[i] = (sum_i * GAS_DENSITY) as Real;
-        }
+        sigma_tot_e[i] = (sum_e * GAS_DENSITY) as Real;
+        sigma_tot_i[i] = (sum_i * GAS_DENSITY) as Real;
     }
 
     (cs_flat, sigma_tot_e, sigma_tot_i)
@@ -1768,21 +1742,13 @@ fn save_info(
     let mut max_icoll_freq: f64 = 0.0;
     for i in 0..CS_RANGES {
         let e: f64 = (i as f64) * DE_CS;
-        let se: f64 = sigma_tot_e[i] as f64;
-        let si: f64 = sigma_tot_i[i] as f64;
-
-        let nu_e = if PRECOMPUTE_COLLISION_FREQ {
-            se
-        } else {
-            (2.0 * e * EV_TO_J / E_MASS).sqrt() * se
-        };
+        let v  = (2.0 * e * EV_TO_J / E_MASS).sqrt();
+        
+        let nu_e = v * sigma_tot_e[i] as f64;
         if nu_e > max_ecoll_freq { max_ecoll_freq = nu_e; }
 
-        let nu_i = if PRECOMPUTE_COLLISION_FREQ {
-            si
-        } else {
-            (2.0 * e * EV_TO_J / MU_ARAR).sqrt() * si
-        };
+        let v  = (2.0 * e * EV_TO_J / MU_ARAR).sqrt();
+        let nu_i = v * sigma_tot_i[i] as f64;
         if nu_i > max_icoll_freq { max_icoll_freq = nu_i; }
     }
 
