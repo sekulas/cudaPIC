@@ -398,81 +398,6 @@ mod kernels {
     use super::*;
 
     #[kernel]
-    pub fn OLD_move_particles(
-        efield:   &[Real],
-        mut x:    DisjointSlice<Real>,
-        mut vx:   DisjointSlice<Real>,
-        n_active: &[u32],
-        factor:   Real,
-        dt:       Real,
-    ) {
-        // E-field loaded cooperatively into shared memory once per block,
-        // eliminating repeated global memory reads.
-        static mut EFIELD_SHARED: SharedArray<Real, N_G> = SharedArray::UNINIT;
-
-        let tid        = thread::threadIdx_x() as usize;
-        let block_size = thread::blockDim_x()  as usize;
-
-        // Each thread loads ceil(N_G / block_size) elements.
-        let mut k = tid;
-        while k < N_G {
-            unsafe { EFIELD_SHARED[k] = efield[k]; }
-            k += block_size;
-        }
-        thread::sync_threads();
-
-        if let Some((x_val, idx)) = x.get_mut_indexed() {
-            let i = idx.get();
-            if i >= n_active[0] as usize {
-                return;
-            }
-
-            if let Some(vx_val) = vx.get_mut(idx) {
-                let pos = *x_val * INV_DX as Real;
-                let p   = pos as usize;                
-                let c2  = pos - p as Real;
-                let e_x = unsafe {
-                    (1.0 as Real - c2) * EFIELD_SHARED[p]
-                        + c2 * EFIELD_SHARED[p + 1]
-                };
-
-                let new_vx = *vx_val + factor * e_x;
-                *vx_val = new_vx;
-                *x_val  = *x_val + new_vx * dt;
-            }
-        }
-    }
-
-    // TODO - no shmem perf testing
-    #[kernel]
-    pub fn move_particles(
-        efield:   &[Real],
-        mut x:    DisjointSlice<Real>,
-        mut vx:   DisjointSlice<Real>,
-        n_active: &[u32],
-        factor:   Real,
-        dt:       Real,
-    ) {
-        if let Some((x_val, idx)) = x.get_mut_indexed() {
-            let i = idx.get();
-            if i >= n_active[0] as usize {
-                return;
-            }
-            if let Some(vx_val) = vx.get_mut(idx) {
-                let pos = *x_val * INV_DX as Real;
-                let p   = pos as usize;                
-                let c2  = pos - p as Real;
-                let e_x = (1.0 as Real - c2) * efield[p]
-                        + c2 * efield[p + 1];
-
-                let new_vx = *vx_val + factor * e_x;
-                *vx_val = new_vx;
-                *x_val  = *x_val + new_vx * dt;
-            }
-        }
-    }
-
-    #[kernel]
     pub fn get_density(
         x:             &[Real],
         density:       &[Real],
@@ -613,131 +538,70 @@ mod kernels {
         }
     }
 
-    // per-block inclusive prefix scan over an
-    // alive/dead flag (`block_scan`, fully parallel within a block in O(log N)
-    // steps), plus a single `atomicAdd` per block to reserve a contiguous slot
-    // range in the destination buffer. Each survivor writes to its globally unique
-    // slot `base + inclusive - 1`.
+
     #[kernel]
-    pub fn check_boundaries_compact(
-        src_x:  &[Real],
-        src_vx: &[Real],
-        src_vy: &[Real],
-        src_vz: &[Real],
-        mut dst_x:  DisjointSlice<Real>,
-        mut dst_vx: DisjointSlice<Real>,
-        mut dst_vy: DisjointSlice<Real>,
-        mut dst_vz: DisjointSlice<Real>,
-        alive_counter: &[u32],   // global alive count (MUST BE zeroed before launch)
-        n_active:      &[u32],
+    pub fn solve_poisson_dps_flexible(
+        source:    &[f32],              
+        mut pot:   DisjointSlice<f32>,  
+        n:         u32,                 // number of grid points (with boundaries)
+        psi_left:  f32,                 
+        psi_right: f32,                 
+        dx:        f32,
     ) {
-        static mut SCAN_SMEM: SharedArray<u32, COMPACT_NUM_WARPS> = SharedArray::UNINIT;
-        static mut BASE_S:    SharedArray<u32, 1>                 = SharedArray::UNINIT;
+        static mut SCAN_SMEM: SharedArray<f32, POISSON_SCAN_NUM_WARPS> = SharedArray::UNINIT;
+        static mut R_TOTAL_S: SharedArray<f32, 1> = SharedArray::UNINIT;
 
-        let block = this_thread_block();
         let tid   = thread::threadIdx_x() as usize;
-        let bdim  = thread::blockDim_x()  as usize;
-        let i     = thread::index_1d().get();
+        let block = this_thread_block();
+        let nn    = n as usize;
 
-        let mut flag: u32 = 0;
-        if i < n_active[0] as usize {
-            let xi = src_x[i];
-            if xi >= 0.0 as Real && xi <= L as Real {
-                flag = 1;
-            }
-        }
+        let g_i: f32 = if tid == 0 || tid >= nn {
+            0.0f32
+        } else {
+            let mut f_i = dx * dx * source[tid];
+            if tid == 1      { f_i -= psi_left; }
+            if tid == nn - 2 { f_i -= psi_right; }
+            (tid as f32) * f_i
+        };
 
-        let incl = block_scan::<u32, Sum, _>(&block, flag, &raw mut SCAN_SMEM);
-
-        if tid == bdim - 1 {
-            let g    = unsafe { DeviceAtomicU32::from_ptr(alive_counter.as_ptr() as *mut u32) };
-            let base = if incl > 0 { g.fetch_add(incl, AtomicOrdering::Relaxed) } else { 0 };
-            unsafe { BASE_S[0] = base; }
-        }
+        let big_g_i = block_scan::<f32, Sum, _>(&block, g_i, &raw mut SCAN_SMEM);
 
         thread::sync_threads();
 
-        // each SURVIVING thread owns a distinct `slot`: prefix scan + per-block base
-        if flag == 1 {
-            let base = unsafe { BASE_S[0] };
-            let slot = base as usize + incl as usize - 1; // inclusive scan -> subtract self
-            unsafe {
-                *dst_x.get_unchecked_mut(slot)  = src_x[i];
-                *dst_vx.get_unchecked_mut(slot) = src_vx[i];
-                *dst_vy.get_unchecked_mut(slot) = src_vy[i];
-                *dst_vz.get_unchecked_mut(slot) = src_vz[i];
-            }
-        }
-    }
+        let r_i: f32 = if tid == 0 || tid >= nn - 1 {
+            0.0f32
+        } else {
+            let h_i = -big_g_i / (tid as f32 + 1.0f32);
+            h_i / (tid as f32)
+        };
 
-    // fused move_particles + check_boundaries_compact kernel.
-    #[kernel]
-    pub fn OLD_move_and_compact(
-        efield:   &[Real],
-        src_x:    &[Real],
-        src_vx:   &[Real],
-        src_vy:   &[Real],
-        src_vz:   &[Real],
-        mut dst_x:  DisjointSlice<Real>,
-        mut dst_vx: DisjointSlice<Real>,
-        mut dst_vy: DisjointSlice<Real>,
-        mut dst_vz: DisjointSlice<Real>,
-        alive_counter: &[u32],   // global alive count (MUST be zeroed before launch)
-        n_active:      &[u32],
-        factor:   Real,
-        dt:       Real,
-    ) {
-        static mut SCAN_SMEM: SharedArray<u32, COMPACT_NUM_WARPS> = SharedArray::UNINIT;
-        static mut BASE_S:    SharedArray<u32, 1>                 = SharedArray::UNINIT;
+        let big_r_i = block_scan::<f32, Sum, _>(&block, r_i, &raw mut SCAN_SMEM);
 
-        let block = this_thread_block();
-        let tid   = thread::threadIdx_x() as usize;
-        let bdim  = thread::blockDim_x()  as usize;
-        let i     = thread::index_1d().get();
-
-        let mut flag: u32 = 0;
-        let mut new_x:  Real = 0.0;
-        let mut new_vx: Real = 0.0;
-
-        if i < n_active[0] as usize {
-            let xi  = src_x[i];
-            let vxi = src_vx[i];
-
-            let pos = xi * INV_DX as Real;
-            let p   = pos as usize;
-            let c2  = pos - p as Real;
-            let e_x = (1.0 as Real - c2) * efield[p]
-                    + c2 * efield[p + 1];
-
-            new_vx = vxi + factor * e_x;
-            new_x  = xi  + new_vx * dt;
-
-            if new_x >= 0.0 as Real && new_x <= L as Real {
-                flag = 1;
-            }
+        if tid == nn - 2 {
+            unsafe { R_TOTAL_S[0] = big_r_i; }
         }
 
-        let incl = block_scan::<u32, Sum, _>(&block, flag, &raw mut SCAN_SMEM);
+        thread::sync_threads();
+        let r_total = unsafe { R_TOTAL_S[0] };
 
-        if tid == bdim - 1 {
-            let g    = unsafe { DeviceAtomicU32::from_ptr(alive_counter.as_ptr() as *mut u32) };
-            let base = g.fetch_add(incl, AtomicOrdering::Relaxed);
-            unsafe { BASE_S[0] = base; }
-        }
+        let pot_i: f32 = if tid == 0 {
+            psi_left
+        } else if tid < nn - 1 {
+            (tid as f32) * (r_total - big_r_i + r_i)
+        } else if tid == nn - 1 {
+            psi_right
+        } else {
+            0.0f32
+        };
+
         thread::sync_threads();
 
-        if flag == 1 {
-            let base = unsafe { BASE_S[0] };
-            let slot = base as usize + incl as usize - 1;
-            unsafe {
-                *dst_x.get_unchecked_mut(slot)  = new_x;
-                *dst_vx.get_unchecked_mut(slot) = new_vx;
-                *dst_vy.get_unchecked_mut(slot) = src_vy[i];
-                *dst_vz.get_unchecked_mut(slot) = src_vz[i];
+        if let Some((pot_elem, _idx)) = pot.get_mut_indexed() {
+            if tid < nn {
+                *pot_elem = pot_i;
             }
         }
     }
-
 
     #[kernel]
     pub fn move_and_compact(
@@ -750,7 +614,7 @@ mod kernels {
         mut dst_vx: DisjointSlice<Real>,
         mut dst_vy: DisjointSlice<Real>,
         mut dst_vz: DisjointSlice<Real>,
-        alive_counter: &[u32],   // MUSI być zerowany przed launchem
+        alive_counter: &[u32],   // global alive count (MUST be zeroed before launch)
         n_active:      &[u32],
         factor:   Real,
         dt:       Real,
@@ -837,80 +701,6 @@ mod kernels {
                 *dst_vx.get_unchecked_mut(slot) = new_vx;
                 *dst_vy.get_unchecked_mut(slot) = vyi;
                 *dst_vz.get_unchecked_mut(slot) = vzi;
-            }
-        }
-    }
-
-    /// testing: flexible Double-Prefix-Sum Poisson solver for convergence testing
-    /// solves ψ[i-1] - 2ψ[i] + ψ[i+1] = f[i] where f[i] = dx²·source[i].
-    /// outputs only potential (no E-field) since convergence test needs only ψ.
-    #[kernel]
-    pub fn solve_poisson_dps_flexible(
-        source:    &[f32],              // source term s(x_i), length = n
-        mut pot:   DisjointSlice<f32>,  // output potential, length = n
-        n:         u32,                 // number of grid points (including boundaries)
-        psi_left:  f32,                 // ψ(0) boundary condition
-        psi_right: f32,                 // ψ(N-1) boundary condition
-        dx:        f32,                 // grid spacing
-    ) {
-        static mut SCAN_SMEM: SharedArray<f32, DPS_TEST_WARPS>   = SharedArray::UNINIT;
-        static mut H_S:       SharedArray<f32, DPS_TEST_MAX_N>   = SharedArray::UNINIT;
-        static mut TOTAL_S:   SharedArray<f32, 1>                = SharedArray::UNINIT;
-
-        let tid   = thread::threadIdx_x() as usize;
-        let nn    = n as usize;
-        let block = this_thread_block();
-        let dx2   = dx * dx;
-
-        let g_i: f32 = if tid == 0 || tid >= nn {
-            0.0f32
-        } else {
-            let mut f_i = dx2 * source[tid];
-            if tid == 1        { f_i -= psi_left; }
-            if tid == nn - 2   { f_i -= psi_right; }
-            (tid as f32) * f_i
-        };
-
-        let s_i = block_scan::<f32, Sum, _>(&block, g_i, &raw mut SCAN_SMEM);
-
-        let h_i: f32 = if tid == 0 || tid >= nn {
-            0.0f32
-        } else {
-            -s_i / (tid as f32 + 1.0f32)
-        };
-
-        if tid < nn {
-            unsafe { H_S[tid] = h_i; }
-        }
-        thread::sync_threads();
-
-        let r_i: f32 = if tid == 0 || tid >= nn - 1 {
-            0.0f32
-        } else {
-            unsafe { H_S[tid] / (tid as f32) }
-        };
-
-        let big_r_i = block_scan::<f32, Sum, _>(&block, r_i, &raw mut SCAN_SMEM);
-
-        if tid == nn - 2 {
-            unsafe { TOTAL_S[0] = big_r_i; }
-        }
-        thread::sync_threads();
-        let total = unsafe { TOTAL_S[0] };
-
-        let pot_i: f32 = if tid == 0 {
-            psi_left
-        } else if tid < nn - 1 {
-            (tid as f32) * (total - big_r_i + r_i)
-        } else if tid == nn - 1 {
-            psi_right
-        } else {
-            0.0f32
-        };
-
-        if let Some((pot_elem, _idx)) = pot.get_mut_indexed() {
-            if tid < nn {
-                *pot_elem = pot_i;
             }
         }
     }
@@ -1135,7 +925,7 @@ mod kernels {
 
     fn rng_next_three_normal(
         i: usize, 
-        sigma: Real, // standard deviation of the normal distribution
+        sigma: Real,
         rng0: &mut DisjointSlice<u32>, 
         rng1: &mut DisjointSlice<u32>, 
         rng2: &mut DisjointSlice<u32>, 
@@ -1219,8 +1009,6 @@ mod kernels {
         
     }
 
-    // TODO - options(may_diverge) sprawdź dla inline ptx.
-
     pub fn collision_e(cs: &[Real], x: &mut DisjointSlice<Real>, vx: &mut DisjointSlice<Real>, vy: &mut DisjointSlice<Real>, vz: &mut DisjointSlice<Real>, i: usize, 
                     energy_index: usize, rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>,
                     i_x: &mut DisjointSlice<Real>, i_vx: &mut DisjointSlice<Real>, i_vy: &mut DisjointSlice<Real>, i_vz: &mut DisjointSlice<Real>, alive_e: &[u32], alive_i: &[u32]) {
@@ -1232,7 +1020,7 @@ mod kernels {
         let wy: Real = F1 * unsafe { *vy.get_unchecked_mut(i) };
         let wz: Real = F1 * unsafe { *vz.get_unchecked_mut(i) };
 
-        // Cross-section lookup using energy_index (computed in check_collisions_e)
+        // cross-section lookup using energy_index
         let t0: Real = cs[E_ELA * CS_RANGES + energy_index];
         let t1: Real = t0 + cs[E_EXC * CS_RANGES + energy_index];
         let t2: Real = t1 + cs[E_ION * CS_RANGES + energy_index];
@@ -1513,8 +1301,6 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
     let mut sigma_tot_e = vec![0.0 as Real; CS_RANGES];
     let mut sigma_tot_i = vec![0.0 as Real; CS_RANGES];
 
-    // Cross-section formulas always computed in f64 for numerical accuracy,
-    // then stored as Real for GPU consumption. // TODO - verify if this is necessary or if we can compute directly in Real (f32) for single-precision GPU.
     let qmom = |e: f64| -> f64 {
         1.0e-20*(
         (6.0/(1.0+e/0.1+(e/0.6).powf(2.0)).powf(3.3)-1.1*e.powf(1.4)/
@@ -1565,7 +1351,6 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
     (cs_flat, sigma_tot_e, sigma_tot_i)
 }
 
-/// generate xoshiro128+ seed state for all particle slots.
 fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
     debug_assert!(master_seed != [0, 0, 0, 0], "state should not be everywhere 0");
 
@@ -1705,111 +1490,6 @@ fn save_eepf(eepf_raw: &[u32], tsmp: DateTime<Tz>) {
         writeln!(file, "{},{}", e, val).expect("row");
     }
 }
-
-
-fn save_info(
-    cumul_e: &[f64],           // accumulated electron density, downloaded to host [N_G]
-    eepf_raw: &[u32],          // accumulated EEPF histogram, downloaded to host [N_EEPF]
-    sigma_tot_e: &[Real],      // host-side total electron cross-section table [CS_RANGES] (pre-upload)
-    sigma_tot_i: &[Real],      // host-side total ion cross-section table [CS_RANGES] (pre-upload)
-    n_steps_e: f64,            // normalization used for cumul_e, i.e. measurement_cycles * N_T
-    num_cycles: usize,         // total cycles run in this invocation
-    measurement_cycles: usize, // cycles actually covered by the measurement window
-    tsmp: DateTime<Tz>,
-) -> bool {
-    let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
-    let dir_path = format!("results/{}", time_stamp);
-    fs::create_dir_all(&dir_path).expect("unable to create directory");
-    let filename = format!("{}/info_{}.txt", dir_path, time_stamp);
-    let mut file = File::create(&filename).expect("unable to create file");
-
-    let density: f64 = cumul_e[N_G / 2] as f64 / n_steps_e;               // e density @ center [m^-3]
-    let plas_freq: f64 = E_CHARGE * (density / EPSILON0 / E_MASS).sqrt(); // e plasma frequency @ center
-
-    let total_count: u64 = eepf_raw.iter().map(|&c| c as u64).sum();
-    let meane: f64 = if total_count > 0 {
-        let energy_sum: f64 = eepf_raw.iter().enumerate()
-            .map(|(i, &c)| (0.5 + i as f64) * DE_EEPF * c as f64)
-            .sum();
-        energy_sum / total_count as f64
-    } else {
-        0.0
-    };
-    let kT: f64 = 2.0 * meane * EV_TO_J / 3.0;                           // k T_e @ center (approximate)
-    let debye_length: f64 = (EPSILON0 * kT / density).sqrt() / E_CHARGE; // e Debye length @ center
-
-    let mut max_ecoll_freq: f64 = 0.0;
-    let mut max_icoll_freq: f64 = 0.0;
-    for i in 0..CS_RANGES {
-        let e: f64 = (i as f64) * DE_CS;
-        let v  = (2.0 * e * EV_TO_J / E_MASS).sqrt();
-        
-        let nu_e = v * sigma_tot_e[i] as f64;
-        if nu_e > max_ecoll_freq { max_ecoll_freq = nu_e; }
-
-        let v  = (2.0 * e * EV_TO_J / MU_ARAR).sqrt();
-        let nu_i = v * sigma_tot_i[i] as f64;
-        if nu_i > max_icoll_freq { max_icoll_freq = nu_i; }
-    }
-
-    writeln!(file, "########################## eduPIC-GPU simulation report ########################").ok();
-    writeln!(file, "Simulation parameters:").ok();
-    writeln!(file, "Gap distance                          = {:1.6e} [m]",  L).ok();
-    writeln!(file, "# of grid divisions                   = {:10}",        N_G).ok();
-    writeln!(file, "Frequency                             = {:1.6e} [Hz]", FREQUENCY).ok();
-    writeln!(file, "# of time steps / period              = {:10}",        N_T).ok();
-    writeln!(file, "# of electron / ion time steps        = {:10}",        N_SUB).ok();
-    writeln!(file, "Voltage amplitude                     = {:1.6e} [V]",  VOLTAGE).ok();
-    writeln!(file, "Pressure (Ar)                         = {:1.6e} [Pa]", PRESSURE).ok();
-    writeln!(file, "Temperature                           = {:1.6e} [K]",  TEMPERATURE).ok();
-    writeln!(file, "Superparticle weight                  = {:1.6e} [m]",  WEIGHT).ok();
-    writeln!(file, "# of simulation cycles (total run)    = {:10}",        num_cycles).ok();
-    writeln!(file, "# of cycles in measurement window     = {:10}",        measurement_cycles).ok();
-    writeln!(file, "--------------------------------------------------------------------------------").ok();
-    writeln!(file, "Plasma characteristics:").ok();
-    writeln!(file, "Electron density @ center              = {:1.6e} [m^-3]",  density).ok();
-    writeln!(file, "Plasma frequency @ center              = {:1.6e} [rad/s]", plas_freq).ok();
-    writeln!(file, "Debye length @ center                  = {:1.6e} [m]",     debye_length).ok();
-    writeln!(file, "--------------------------------------------------------------------------------").ok();
-    writeln!(file, "Stability and accuracy conditions:").ok();
-
-    let mut conditions_ok = true;
-
-    let c1: f64 = plas_freq * DT_E;
-    writeln!(file, "Plasma frequency @ center * DT_E      = {:10.4} (OK if less than 0.20)", c1).ok();
-    if c1 > 0.2 { conditions_ok = false; }
-
-    let c2: f64 = DX / debye_length;
-    writeln!(file, "DX / Debye length @ center             = {:10.4} (OK if less than 1.00)", c2).ok();
-    if c2 > 1.0 { conditions_ok = false; }
-
-    let c3: f64 = max_ecoll_freq * DT_E;
-    writeln!(file, "Max. electron coll. frequency * DT_E  = {:10.4} (OK if less than 0.05)", c3).ok();
-    if c3 > 0.05 { conditions_ok = false; }
-
-    let c4: f64 = max_icoll_freq * DT_I;
-    writeln!(file, "Max. ion coll. frequency * DT_I       = {:10.4} (OK if less than 0.05)", c4).ok();
-    if c4 > 0.05 { conditions_ok = false; }
-
-    if !conditions_ok {
-        writeln!(file, "--------------------------------------------------------------------------------").ok();
-        writeln!(file, "** STABILITY AND ACCURACY CONDITION(S) VIOLATED - REFINE SIMULATION SETTINGS! **").ok();
-        writeln!(file, "--------------------------------------------------------------------------------").ok();
-    } else {
-        let v_max: f64 = DX / DT_E;
-        let e_max: f64 = 0.5 * E_MASS * v_max * v_max / EV_TO_J;
-        writeln!(file, "Max e- energy for CFL condition       = {:10.4} [eV]", e_max).ok();
-        writeln!(file, "Check EEPF to ensure that CFL is fulfilled for the majority of the electrons!").ok();
-        writeln!(file, "--------------------------------------------------------------------------------").ok();
-    }
-
-    writeln!(file, "Particle characteristics at the electrodes, and power absorption:").ok();
-    writeln!(file, "  not available in this build").ok();
-    writeln!(file, "--------------------------------------------------------------------------------\n").ok();
-
-    conditions_ok
-}
-
 
 fn main() {
     // perform_tests();
@@ -2041,16 +1721,6 @@ fn main() {
         save_density_avg(&cumul_e, &cumul_i, n_steps_e, n_steps_i, tsmp);
         save_eepf(&eepf_raw, tsmp);
 
-        let conditions_ok = save_info(
-            &cumul_e, &eepf_raw, &sigma_tot_e, &sigma_tot_i,
-            n_steps_e, num_cycles, measurement_cycles, tsmp,
-        );
-        if !conditions_ok {
-            let ts = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
-            println!(">> eduPIC-GPU: ERROR = STABILITY AND ACCURACY CONDITION(S) VIOLATED!");
-            println!(">> eduPIC-GPU: see 'results/{}/info_{}.txt' and refine simulation settings!", ts, ts);
-        }
-
         println!(">> eduPIC-GPU: measurement data saved (density_avg, eepf, info) for {} cycles", measurement_cycles);
     }
 }
@@ -2065,752 +1735,78 @@ fn perform_checks() -> Result<(), Box<dyn std::error::Error>> {
 // tests
 
 fn perform_tests() {
-    test_move_particles_analytic();
-    test_move_particles_edge_cases();
-    test_move_particles();
-    test_dps_convergence_cpu();
-    test_dps_convergence_gpu();
-    bench_shmem_vs_no_shmem();
-    test_deposit_charge_analytic();
-    test_deposit_charge();
-    test_check_boundaries_unit();
-    test_check_boundaries_many_blocks();
+    test_gpu_dps_convergence_hakim();
+    std::process::exit(0);
 }
 
-// expected result is computable without oracle
-fn test_move_particles_analytic() {
-    const E_UNIFORM: Real = 100.0;
-    let efield_host = vec![E_UNIFORM; N_G];
-
-    let n: usize = 10;
-    let x_host:  Vec<Real> = (0..n).map(|i| L as Real * (i as Real + 0.5) / n as Real).collect();
-    let vx_host: Vec<Real> = (0..n).map(|i| (i as Real - n as Real / 2.0) * 1e5).collect();
-
-    let ctx    = CudaContext::new(0).unwrap();
-    let stream = ctx.default_stream();
-    let efield_dev  = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
-    let mut x_dev   = DeviceBuffer::from_host(&stream, &x_host).unwrap();
-    let mut vx_dev  = DeviceBuffer::from_host(&stream, &vx_host).unwrap();
-    let amount = DeviceBuffer::from_host(&stream, &[n as u32]).unwrap();
-    let module = kernels::load(&ctx).unwrap();
-    let cfg    = LaunchConfig::for_num_elems(n as u32);
-    module.move_particles(&stream, cfg,
-        &efield_dev, &mut x_dev, &mut vx_dev,
-        &amount, FACTOR_E as Real, DT_E as Real,
-    ).unwrap();
-
-    let x_gpu  = x_dev.to_host_vec(&stream).unwrap();
-    let vx_gpu = vx_dev.to_host_vec(&stream).unwrap();
-
-    // analytic expected values:
-    //   new_vx = vx_0 + FACTOR_E * E_UNIFORM
-    //   new_x  = x_0  + new_vx * DT_E
-    let eps: Real = if std::mem::size_of::<Real>() == 4 { 1e-5 as Real } else { 1e-10 as Real };
-    let mut errors = 0;
-    for i in 0..n {
-        let expected_vx = vx_host[i] + FACTOR_E as Real * E_UNIFORM;
-        let expected_x  = x_host[i]  + expected_vx * DT_E as Real;
-        if (vx_gpu[i] - expected_vx).abs() > eps {
-            eprintln!("analytic vx[{}]: got={:.15e} expected={:.15e}", i, vx_gpu[i], expected_vx);
-            errors += 1;
-        }
-        if (x_gpu[i] - expected_x).abs() > eps {
-            eprintln!("analytic x[{}]: got={:.15e} expected={:.15e}", i, x_gpu[i], expected_x);
-            errors += 1;
-        }
-    }
-    if errors > 0 {
-        println!("test_move_particles_analytic: {} mismatches", errors);
-        std::process::exit(1);
-    }
+fn hakim_source_fn(x: f64) -> f64 {
+    1.0 - 2.0 * x * x
 }
 
-fn test_move_particles_edge_cases() {
-    let efield_host: Vec<Real> = (0..N_G).map(|i| (i as Real + 1.0) * 50.0).collect();
-
-    // case A: particle exactly on a grid node (c2 = 0, e_x = efield[p] exactly)
-    // case B: particle near right boundary
-    // case C: zero velocity particle (new_x changes only from field acceleration)
-    let x_cases:  Vec<Real> = vec![
-        10.0 * DX as Real,                      // A: exactly on node 10
-        398.5 * DX as Real,                     // B: near right boundary
-        L as Real * 0.5,                        // C: midpoint, vx = 0
-    ];
-    let vx_cases: Vec<Real> = vec![
-        1e4,   // A
-        1e4,   // B
-        0.0,   // C: zero velocity
-    ];
-    let n = x_cases.len();
-
-    // CPU oracle
-    let mut x_cpu  = x_cases.clone();
-    let mut vx_cpu = vx_cases.clone();
-    for i in 0..n {
-        let p   = (x_cpu[i] * INV_DX as Real) as usize;
-        let c2  = x_cpu[i] * INV_DX as Real - p as Real;
-        let e_x = (1.0 as Real - c2) * efield_host[p] + c2 * efield_host[p + 1];
-        vx_cpu[i] = vx_cpu[i] + FACTOR_E as Real * e_x;
-        x_cpu[i]  = x_cpu[i]  + vx_cpu[i] * DT_E as Real;
-    }
-
-    let ctx    = CudaContext::new(0).unwrap();
-    let stream = ctx.default_stream();
-    let efield_dev  = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
-    let mut x_dev   = DeviceBuffer::from_host(&stream, &x_cases.clone()).unwrap();
-    let mut vx_dev  = DeviceBuffer::from_host(&stream, &vx_cases).unwrap();
-    let module = kernels::load(&ctx).unwrap();
-    let cfg    = LaunchConfig::for_num_elems(n as u32);
-    let amount = DeviceBuffer::from_host(&stream, &[n as u32]).unwrap();
-    module.move_particles(&stream, cfg,
-        &efield_dev, &mut x_dev, &mut vx_dev,
-        &amount, FACTOR_E as Real, DT_E as Real,
-    ).unwrap();
-
-    let x_gpu  = x_dev.to_host_vec(&stream).unwrap();
-    let vx_gpu = vx_dev.to_host_vec(&stream).unwrap();
-
-    // Tolerancje zależne od precyzji:
-    // rel_tol - błąd względny (np. różnica maksymalnie 0.001% między CPU a GPU)
-    // abs_tol - błąd bezwzględny dla liczb bardzo bliskich 0
-    let (rel_tol, abs_tol): (Real, Real) = if std::mem::size_of::<Real>() == 4 { 
-        (1e-4 as Real, 1e-4 as Real) // f32
-    } else { 
-        (1e-11 as Real, 1e-12 as Real) // f64
-    };
-
-    let is_close = |a: Real, b: Real| -> bool {
-        let diff = (a - b).abs();
-        diff <= abs_tol || diff <= rel_tol * a.abs().max(b.abs())
-    };
-
-    let labels = ["grid_node", "near_boundary", "zero_vx"];
-    let mut errors = 0;
-
-    for i in 0..n {
-        if !is_close(x_gpu[i], x_cpu[i]) {
-            eprintln!("edge[{}] x:  GPU={:.15e} CPU={:.15e} (diff={:.15e})", 
-                    labels[i], x_gpu[i], x_cpu[i], (x_gpu[i] - x_cpu[i]).abs());
-            errors += 1;
-        }
-        if !is_close(vx_gpu[i], vx_cpu[i]) {
-            eprintln!("edge[{}] vx: GPU={:.15e} CPU={:.15e} (diff={:.15e})", 
-                    labels[i], vx_gpu[i], vx_cpu[i], (vx_gpu[i] - vx_cpu[i]).abs());
-            errors += 1;
-        }
-    }
-    if errors > 0 {
-        println!("test_move_particles_edge_cases: {} mismatches", errors);
-        std::process::exit(1);
-    }
+fn hakim_exact_fn(x: f64) -> f64 {
+    x * x / 2.0 - x.powi(4) / 6.0 - x / 3.0
 }
 
-fn test_move_particles() {
-    let n_test: usize = 1000;
-    let mut x_host  = vec![0.0 as Real; n_test];
-    let mut vx_host = vec![0.0 as Real; n_test];
-    let efield_host: Vec<Real> = (0..N_G).map(|i| 100.0 * (i as Real / N_G as Real)).collect();
+fn test_gpu_dps_convergence_hakim() {
+    println!("\n>> TEST: DPS Convergence GPU Hakim (JE11)");
+    println!("   source: 1 - 2x^2,  psi(0)=0, psi(1)=0");
+    println!("   {:>6}  {:>12}  {:>14}  {:>10}", "N_elem", "dx", "avg_error", "order");
 
-    for i in 0..n_test {
-        x_host[i] = (L * (i as f64 + 0.5) / n_test as f64) as Real;
-        vx_host[i] = (1000.0 * (i as f64 - n_test as f64 / 2.0)) as Real;
-    }
-
-    // CPU oracle
-    let mut x_cpu = x_host.clone();
-    let mut vx_cpu = vx_host.clone();
-    for i in 0..n_test {
-        let p = (x_cpu[i] * INV_DX as Real) as usize;
-        let c2 = x_cpu[i] * INV_DX as Real - p as Real;
-        let e_x = (1.0 as Real - c2) * efield_host[p] + c2 * efield_host[p + 1];
-        vx_cpu[i] += FACTOR_E as Real * e_x;
-        x_cpu[i] += vx_cpu[i] * DT_E as Real;
-    }
-
-    // GPU execution
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
-    let efield_dev = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
-    let mut x_dev = DeviceBuffer::from_host(&stream, &x_host).unwrap();
-    let mut vx_dev = DeviceBuffer::from_host(&stream, &vx_host).unwrap();
     let module = kernels::load(&ctx).unwrap();
-    let cfg = LaunchConfig::for_num_elems(n_test as u32);
-    let amount = DeviceBuffer::from_host(&stream, &[n_test as u32]).unwrap();
-    module.move_particles(&stream, cfg,
-        &efield_dev, &mut x_dev, &mut vx_dev,
-        &amount,
-        FACTOR_E as Real,
-        DT_E as Real,
-    ).unwrap();
-
-    // compare
-    let x_gpu = x_dev.to_host_vec(&stream).unwrap();
-    let vx_gpu = vx_dev.to_host_vec(&stream).unwrap();
-
-    let eps: Real = if std::mem::size_of::<Real>() == 4 { 1e-5 as Real } else { 1e-10 as Real };
-    let mut errors = 0;
-    for i in 0..n_test {
-        if (x_gpu[i] - x_cpu[i]).abs() > eps {
-            eprintln!("x[{}]: GPU={:.15e} CPU={:.15e} diff={:.2e}", i, x_gpu[i], x_cpu[i], (x_gpu[i]-x_cpu[i]).abs());
-            errors += 1;
-        }
-        if (vx_gpu[i] - vx_cpu[i]).abs() > eps {
-            eprintln!("vx[{}]: GPU={:.15e} CPU={:.15e} diff={:.2e}", i, vx_gpu[i], vx_cpu[i], (vx_gpu[i]-vx_cpu[i]).abs());
-            errors += 1;
-        }
-    }
-
-    if errors > 0 {
-        println!("move_particles: {} mismatches", errors);
-        std::process::exit(1);
-    }
-}
-
-// timing benchmark: shared-memory vs. no-shared-memory particle pusher
-fn bench_shmem_vs_no_shmem() {
-    const N: usize     = MAX_PARTICLES;
-    const REPS: u32    = 1000;
-
-    let ctx    = CudaContext::new(0).unwrap();
-    let stream = ctx.default_stream();
-    let module = kernels::load(&ctx).unwrap();
-    let cfg    = LaunchConfig::for_num_elems(N as u32);
-
-    // random positions across [0, L], random velocities
-    let efield_host: Vec<Real> = (0..N_G).map(|i| 100.0 * (i as Real / N_G as Real)).collect();
-    let x_init:  Vec<Real> = (0..N).map(|i| L as Real * (i as Real / N as Real)).collect();
-    let vx_init: Vec<Real> = (0..N).map(|i| 1000.0 * ((i as Real) - N as Real / 2.0)).collect();
-
-    let efield_dev       = DeviceBuffer::from_host(&stream, &efield_host).unwrap();
-    let mut x_shmem      = DeviceBuffer::from_host(&stream, &x_init).unwrap();
-    let mut vx_shmem     = DeviceBuffer::from_host(&stream, &vx_init).unwrap();
-    let mut x_no_shmem   = DeviceBuffer::from_host(&stream, &x_init).unwrap();
-    let mut vx_no_shmem  = DeviceBuffer::from_host(&stream, &vx_init).unwrap();
-
-    let factor = FACTOR_E as Real;
-    let amount = DeviceBuffer::from_host(&stream, &[N as u32]).unwrap();
-    
-    // dt = 0 freezes positions across launches so particles never leave [0, L].
-    let dt = 0.0 as Real;
-
-    // warm-up (avoids JIT / driver overhead in measurements) TODO - verify if needed
-    for _ in 0..10 {
-        module.move_particles(&stream, cfg,
-            &efield_dev, &mut x_shmem, &mut vx_shmem, &amount, factor, dt).unwrap();
-        module.OLD_move_particles(&stream, cfg,
-            &efield_dev, &mut x_no_shmem, &mut vx_no_shmem, &amount, factor, dt).unwrap();
-    }
-    ctx.synchronize().unwrap();
-
-    // time shared-memory variant
-    let t0 = Instant::now();
-    for _ in 0..REPS {
-        module.move_particles(&stream, cfg,
-            &efield_dev, &mut x_shmem, &mut vx_shmem, &amount, factor, dt).unwrap();
-    }
-    ctx.synchronize().unwrap();
-    let t_shmem = t0.elapsed().as_secs_f64() / REPS as f64 * 1e6; // µs per launch
-
-    // time no-shared-memory variant
-    let t0 = Instant::now();
-    for _ in 0..REPS {
-        module.OLD_move_particles(&stream, cfg,
-            &efield_dev, &mut x_no_shmem, &mut vx_no_shmem, &amount, factor, dt).unwrap();
-    }
-    ctx.synchronize().unwrap();
-    let t_no_shmem = t0.elapsed().as_secs_f64() / REPS as f64 * 1e6;
-
-    println!(">> bench move_particles ({} particles, {} reps):", N, REPS);
-    println!("     shared memory : {:.2} µs/launch", t_shmem);
-    println!("     no shared mem : {:.2} µs/launch", t_no_shmem);
-    println!("     speedup       : {:.2}×", t_no_shmem / t_shmem);
-}
-
-// run zero_density + deposit_charge
-fn run_deposit_on_gpu(x_host: &[Real]) -> Vec<Real> {
-    let ctx    = CudaContext::new(0).unwrap();
-    let stream = ctx.default_stream();
-    let module = kernels::load(&ctx).unwrap();
-
-    let x_dev = DeviceBuffer::from_host(&stream, x_host).unwrap();
-    let density_dev = DeviceBuffer::<Real>::zeroed(&stream, N_G).unwrap();
-
-    let cfg_deposit = LaunchConfig::for_num_elems(x_host.len() as u32);
-    let amount = DeviceBuffer::from_host(&stream, &[x_host.len() as u32]).unwrap();
-
-    module.get_density(
-        &stream, cfg_deposit,
-        &x_dev, &density_dev, &amount,
-    ).unwrap();
-
-    density_dev.to_host_vec(&stream).unwrap()
-}
-
-fn cpu_get_density(x_host: &[Real]) -> Vec<Real> {
-    let mut density = vec![0.0 as Real; N_G];
-    let c: Real = (WEIGHT / (ELECTRODE_AREA * DX)) as Real;
-    for &xi in x_host {
-        let pos = xi * INV_DX as Real;
-        let q   = pos as usize;
-        let rem = pos - q as Real;
-        density[q]     += (1.0 as Real - rem) * c;
-        density[q + 1] += rem * c;
-    }
-    density[0]       *= 2.0 as Real;
-    density[N_G - 1] *= 2.0 as Real;
-    density
-}
-
-fn test_deposit_charge_analytic() {
-    let c: Real = (WEIGHT / (ELECTRODE_AREA * DX)) as Real;
-    let x_host: Vec<Real> = vec![
-        100.5 * DX as Real,
-        50.0  * DX as Real,
-        0.5   * DX as Real,
-        ((N_G - 2) as Real + 0.5) * DX as Real,
-    ];
-
-    let gpu = run_deposit_on_gpu(&x_host);
-    let expected = cpu_get_density(&x_host);
-
-    let eps: Real = if std::mem::size_of::<Real>() == 4 { 1e-4 as Real * c } else { 1e-10 as Real * c };
-    let mut errors = 0;
-    for i in 0..N_G {
-        if (gpu[i] - expected[i]).abs() > eps {
-            eprintln!("deposit_analytic[{}]: GPU={:.6e} expected={:.6e}", i, gpu[i], expected[i]);
-            errors += 1;
-        }
-    }
-    if errors > 0 {
-        println!("test_deposit_charge_analytic: {} mismatches", errors);
-        std::process::exit(1);
-    }
-}
-
-fn test_deposit_charge() {
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
-
-    const N_PART: usize = 100_000;
-    let mut rng = StdRng::seed_from_u64(0xC2DAu64);
-
-    let x_host: Vec<Real> = (0..N_PART)
-        .map(|_| (rng.random::<f64>() * L) as Real)
-        .collect();
-
-    let gpu = run_deposit_on_gpu(&x_host);
-    let cpu = cpu_get_density(&x_host);
-
-    let sum_gpu: f64 = gpu.iter().map(|&v| v as f64).sum::<f64>() * DX;
-    let sum_cpu: f64 = cpu.iter().map(|&v| v as f64).sum::<f64>() * DX;
-
-    // 1. Zależna od precyzji tolerancja dla sumy całkowitej
-    let tol_cons = if std::mem::size_of::<Real>() == 4 { 
-        1e-5 as f64 // Dla f32 błędy akumulacji rzędu 1e-5 są całkowicie normalne
-    } else { 
-        1e-7 as f64 // Dla f64 różnice w kolejności atomicAdd dadzą błąd rzędu 1e-9 do 1e-8
-    };
-
-    let cons_rel = ((sum_gpu - sum_cpu) / sum_cpu).abs();
-    if cons_rel > tol_cons {
-        eprintln!("deposit conservation mismatch: GPU sum*DX = {:.6e}, CPU sum*DX = {:.6e}, rel diff = {:.2e} (limit: {:.2e})",
-            sum_gpu, sum_cpu, cons_rel, tol_cons);
-        std::process::exit(1);
-    }
-
-    let max_cell = cpu.iter().fold(0.0 as Real, |a, &b| if b > a { b } else { a });
-    let tol_cell_rel = if std::mem::size_of::<Real>() == 4 { 1e-4 as Real } else { 1e-8 as Real };
-    let tol_abs: Real = max_cell * tol_cell_rel;
-    let mut errors = 0;
-    let mut max_diff: Real = 0.0;
-    for i in 0..N_G {
-        let d = (gpu[i] - cpu[i]).abs();
-        if d > max_diff { max_diff = d; }
-        if d > tol_abs {
-            if errors < 5 {
-                eprintln!("deposit[{}]: GPU={:.6e} CPU={:.6e} diff={:.2e}", i, gpu[i], cpu[i], d);
-            }
-            errors += 1;
-        }
-    }
-    if errors > 0 {
-        println!("test_deposit_charge: {} cells exceed tol={:.2e}, max_diff={:.2e}",
-            errors, tol_abs, max_diff);
-        std::process::exit(1);
-    }
-}
-
-// =========================
-// check_boundaries tests
-// =========================
-
-// run check_boundaries_compact on the GPU.
-// returns: (dst_x, dst_vx, dst_vy, dst_vz, n_alive).
-// only the first `n_alive` entries of the dst vectors are valid survivors.
-fn run_check_boundaries(
-    x: &[Real], vx: &[Real], vy: &[Real], vz: &[Real],
-) -> (Vec<Real>, Vec<Real>, Vec<Real>, Vec<Real>, u32) {
-    let n = x.len();
-
-    let ctx    = CudaContext::new(0).unwrap();
-    let stream = ctx.default_stream();
-    let module = kernels::load(&ctx).unwrap();
-
-    let src_x  = DeviceBuffer::from_host(&stream, x).unwrap();
-    let src_vx = DeviceBuffer::from_host(&stream, vx).unwrap();
-    let src_vy = DeviceBuffer::from_host(&stream, vy).unwrap();
-    let src_vz = DeviceBuffer::from_host(&stream, vz).unwrap();
-
-    let mut dst_x  = DeviceBuffer::<Real>::zeroed(&stream, n).unwrap();
-    let mut dst_vx = DeviceBuffer::<Real>::zeroed(&stream, n).unwrap();
-    let mut dst_vy = DeviceBuffer::<Real>::zeroed(&stream, n).unwrap();
-    let mut dst_vz = DeviceBuffer::<Real>::zeroed(&stream, n).unwrap();
-
-    let alive   = DeviceBuffer::from_host(&stream, &[0u32]).unwrap();
-    let amount  = DeviceBuffer::from_host(&stream, &[n as u32]).unwrap();
-
-    let cfg = LaunchConfig::for_num_elems(n as u32);
-    module.check_boundaries_compact(
-        &stream, cfg,
-        &src_x, &src_vx, &src_vy, &src_vz,
-        &mut dst_x, &mut dst_vx, &mut dst_vy, &mut dst_vz,
-        &alive, &amount,
-    ).unwrap();
-
-    let n_alive = alive.to_host_vec(&stream).unwrap()[0];
-
-    let dx  = dst_x.to_host_vec(&stream).unwrap();
-    let dvx = dst_vx.to_host_vec(&stream).unwrap();
-    let dvy = dst_vy.to_host_vec(&stream).unwrap();
-    let dvz = dst_vz.to_host_vec(&stream).unwrap();
-
-    (dx, dvx, dvy, dvz, n_alive)
-}
-
-fn test_check_boundaries_unit() {
-    //                  idx:  0     1   2     3   4   5     6   7   8   9
-    // fate:                  pow   ok  gnd   ok  ok  pow   ok  gnd ok  gnd
-    let x: Vec<Real> = vec![
-        -1.0e-3,                 // 0: x < 0           -> abs_pow
-        0.5 * L as Real,         // 1: inside          -> alive
-        L as Real + 1.0e-3,      // 2: x > L           -> abs_gnd
-        0.0,                     // 3: x == 0 (edge)   -> alive
-        0.25 * L as Real,        // 4: inside          -> alive
-        -5.0e-4,                 // 5: x < 0           -> abs_pow
-        L as Real,               // 6: x == L (edge)   -> alive
-        2.0 * L as Real,         // 7: x > L           -> abs_gnd
-        0.75 * L as Real,        // 8: inside          -> alive
-        L as Real + 5.0e-3,      // 9: x > L           -> abs_gnd
-    ];
-
-    // unique velocity signatures so survivor data can be verified exactly.
-    let vx: Vec<Real> = (0..x.len()).map(|i| (i as Real + 1.0) * 10.0).collect();
-    let vy: Vec<Real> = (0..x.len()).map(|i| (i as Real + 1.0) * 100.0).collect();
-    let vz: Vec<Real> = (0..x.len()).map(|i| (i as Real + 1.0) * 1000.0).collect();
-
-    let (dx, dvx, dvy, dvz, n_alive) = run_check_boundaries(&x, &vx, &vy, &vz);
-
-    let mut errors = 0;
-    if n_alive != 5 { 
-        eprintln!("unit alive: got {} expected 5", n_alive); 
-        errors += 1; 
-    }
-
-    let mut got: Vec<(Real, Real, Real, Real)> =
-        (0..n_alive as usize).map(|i| (dx[i], dvx[i], dvy[i], dvz[i])).collect();
-    let mut expected: Vec<(Real, Real, Real, Real)> =
-        [1usize, 3, 4, 6, 8].iter().map(|&i| (x[i], vx[i], vy[i], vz[i])).collect();
-    got.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-    if got.len() == expected.len() {
-        for (g, e) in got.iter().zip(expected.iter()) {
-            if g != e {
-                eprintln!("unit survivor mismatch: got {:?} expected {:?}", g, e);
-                errors += 1;
-            }
-        }
-    }
-    if errors > 0 {
-        println!("test_check_boundaries_unit: {} errors", errors);
-        std::process::exit(1);
-    }
-}
-
-fn test_check_boundaries_many_blocks() {
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
-
-    const N: usize = 100_000;
-    let mut rng = StdRng::seed_from_u64(0xB0DEu64);
-
-    // positions in [-0.1 L, 1.1 L] -> ~1/12 absorbed at each electrode
-    let x: Vec<Real> = (0..N)
-        .map(|_| ((rng.random::<f64>() * 1.2 - 0.1) * L) as Real)
-        .collect();
-
-    // unique per-particle velocity keys
-    let vx: Vec<Real> = (0..N).map(|i| i as Real).collect();
-    let vy: Vec<Real> = (0..N).map(|i| (i as Real) * 2.0).collect();
-    let vz: Vec<Real> = (0..N).map(|i| (i as Real) * 3.0).collect();
-
-    // CPU reference
-    let mut ref_alive: Vec<(Real, Real, Real, Real)> = Vec::new();
-    for i in 0..N {
-        if x[i] >= 0.0 as Real && x[i] <= L as Real {
-            ref_alive.push((x[i], vx[i], vy[i], vz[i]));
-        }
-    }
-
-    let (dx, dvx, dvy, dvz, n_alive) = run_check_boundaries(&x, &vx, &vy, &vz);
-
-    let mut errors = 0;
-    if n_alive as usize != ref_alive.len() {
-        eprintln!("alive: got {} expected {}", n_alive, ref_alive.len());
-        errors += 1;
-    }
-
-    let mut got: Vec<(Real, Real, Real, Real)> =
-        (0..n_alive as usize).map(|i| (dx[i], dvx[i], dvy[i], dvz[i])).collect();
-    got.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-    if got.len() == ref_alive.len() {
-        for (g, e) in got.iter().zip(ref_alive.iter()) {
-            if g != e {
-                if errors < 5 {
-                    eprintln!("survivor mismatch: got {:?} expected {:?}", g, e);
-                }
-                errors += 1;
-            }
-        }
-    }
-    if errors > 0 {
-        println!("test_check_boundaries: {} errors", errors);
-        std::process::exit(1);
-    }
-}
-
-// =====================
-// Poisson solver tests
-// =====================
-
-// Flexible DPS test kernel: supports up to 512 grid points (N=8..400).
-const DPS_TEST_BLOCK: u32    = 512;
-const DPS_TEST_WARPS: usize  = DPS_TEST_BLOCK as usize / 32;    // = 16
-const DPS_TEST_MAX_N: usize  = 512;
-
-/// Generic CPU Double-Prefix-Sum solver for ψ''(x) = s(x) on [0,1]
-/// with Dirichlet BCs ψ(0)=psi_left, ψ(N-1)=psi_right.
-///
-/// Discretization: ψ[i-1] - 2ψ[i] + ψ[i+1] = dx² · s(x_i)
-/// for interior nodes i=1..N-2.
-///
-/// This is the same algorithm as the GPU kernel `solve_poisson_scan_f32`,
-/// parametrized by grid size N instead of the fixed N_G=400.
-fn solve_poisson_dps_flexible_cpu(n: usize, source: &[f64], psi_left: f64, psi_right: f64) -> Vec<f64> {
-    let dx = 1.0 / (n - 1) as f64;
-
-    let mut f = vec![0.0f64; n];
-    for i in 1..=(n - 2) {
-        f[i] = dx * dx * source[i];
-    }
-    f[1]     -= psi_left;
-    f[n - 2] -= psi_right;
-
-    let mut g = vec![0.0f64; n];
-    for i in 1..n {
-        g[i] = (i as f64) * f[i];
-    }
-    let mut s = vec![0.0f64; n];
-    for i in 1..n {
-        s[i] = s[i - 1] + g[i];
-    }
-
-    let mut h = vec![0.0f64; n];
-    for i in 1..(n - 1) {
-        h[i] = -s[i] / (i as f64 + 1.0);
-    }
-
-    let mut r = vec![0.0f64; n];
-    for i in 1..(n - 1) {
-        r[i] = h[i] / (i as f64);
-    }
-    let mut big_r = vec![0.0f64; n];
-    for i in 1..n {
-        big_r[i] = big_r[i - 1] + r[i];
-    }
-    let total = big_r[n - 2];
-
-    let mut psi = vec![0.0f64; n];
-    psi[0]     = psi_left;
-    psi[n - 1] = psi_right;
-    for i in 1..(n - 1) {
-        psi[i] = (i as f64) * (total - big_r[i] + r[i]);
-    }
-    psi
-}
-
-// Convergence test for Double-Prefix-Sum Poisson solver.
-// (https://ammar-hakim.org/sj/je/je11/je11-fem-poisson.html#convergence-of-1d-solver) 
-//
-// Problem: ψ''(x) = 1 - 2x² on [0,1], ψ(0)=ψ(1)=0
-// Exact:   ψ(x) = x²/2 - x⁴/6 - x/3
-//
-// Expected: second-order convergence (error ∝ dx²), order → 2.0.
-// Writes results to `results/dps_cpu_N{n}.csv`.
-fn test_dps_convergence_cpu() {
-    use std::fs;
-    use std::io::Write;
-
-    let a: f64 = 2.0;
-    let source_fn = |x: f64| -> f64 { 1.0 - a * x * x };
-    let exact_fn  = |x: f64| -> f64 { x * x / 2.0 - x.powi(4) / 6.0 - x / 3.0 };
-
-    let grid_sizes: &[usize] = &[8, 16, 32, 64, 100, 200, 400];
-    let mut errors: Vec<f64> = Vec::new();
-    let mut dxs: Vec<f64> = Vec::new();
-
-    fs::create_dir_all("results").unwrap();
-
-    println!(">> test_dps_convergence: ψ''(x) = 1 - 2x², ψ(0)=ψ(1)=0");
-    println!("   {:>4}  {:>12}  {:>12}  {:>8}", "N", "dx", "avg_error", "order");
-
-    for &n in grid_sizes {
-        let dx = 1.0 / (n - 1) as f64;
-        dxs.push(dx);
-
-        let source: Vec<f64> = (0..n).map(|i| source_fn(i as f64 * dx)).collect();
-        let psi_num = solve_poisson_dps_flexible_cpu(n, &source, 0.0, 0.0);
-
-        let mut file = fs::File::create(format!("results/dps_cpu_N{}.csv", n)).unwrap();
-        writeln!(file, "x,psi_num,psi_exact").unwrap();
-        for i in 0..n {
-            let x = i as f64 * dx;
-            writeln!(file, "{:.15e},{:.15e},{:.15e}", x, psi_num[i], exact_fn(x)).unwrap();
-        }
-
-        let mut err_sum = 0.0f64;
-        let mut count = 0usize;
-        for i in 1..(n - 1) {
-            let x = i as f64 * dx;
-            err_sum += (psi_num[i] - exact_fn(x)).abs();
-            count += 1;
-        }
-        let avg_err = err_sum / count as f64;
-        errors.push(avg_err);
-
-        let order = if errors.len() >= 2 {
-            (errors[errors.len() - 2] / errors[errors.len() - 1]).ln()
-                / (dxs[dxs.len() - 2] / dxs[dxs.len() - 1]).ln()
-        } else { 0.0 };
-
-        if errors.len() >= 2 {
-            println!("   {:>4}  {:>12.6e}  {:>12.6e}  {:>8.4}", n, dx, avg_err, order);
-        } else {
-            println!("   {:>4}  {:>12.6e}  {:>12.6e}  {:>8}", n, dx, avg_err, "---");
-        }
-    }
-
-    let final_order = (errors[errors.len() - 2] / errors[errors.len() - 1]).ln()
-        / (dxs[dxs.len() - 2] / dxs[dxs.len() - 1]).ln();
-
-    let mut test_errors = 0;
-    for i in 1..errors.len() {
-        if errors[i] >= errors[i - 1] { test_errors += 1; }
-    }
-    if final_order < 1.8 { test_errors += 1; }
-    if errors[errors.len() - 1] > 1e-4 { test_errors += 1; }
-
-    if test_errors > 0 {
-        println!("test_dps_convergence: FAILED ({} assertions)", test_errors);
-        std::process::exit(1);
-    }
-    println!("   → PASSED (order={:.4}), files written to results/dps_cpu_N*.csv", final_order);
-}
-
-// GPU convergence test — writes results to `results/dps_gpu_N{n}.csv`.
-fn test_dps_convergence_gpu() {
-    use std::fs;
-    use std::io::Write;
-
-    let a: f64 = 2.0;
-    let source_fn = |x: f64| -> f64 { 1.0 - a * x * x };
-    let exact_fn  = |x: f64| -> f64 { x * x / 2.0 - x.powi(4) / 6.0 - x / 3.0 };
-
-    let ctx    = CudaContext::new(0).unwrap();
-    let stream = ctx.default_stream();
-    let module = kernels::load(&ctx).unwrap();
-
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
-        block_dim: (DPS_TEST_BLOCK, 1, 1),
+        block_dim: (POISSON_SCAN_BLOCK_SIZE, 1, 1),
         shared_mem_bytes: 0,
     };
 
-    let grid_sizes: &[usize] = &[8, 16, 32, 64, 100, 200, 400];
-    let mut errors: Vec<f64> = Vec::new();
+    let n_elements = &[8usize, 16, 32, 64];
     let mut dxs: Vec<f64> = Vec::new();
+    let mut errors: Vec<f64> = Vec::new();
 
     fs::create_dir_all("results").unwrap();
 
-    println!(">> test_dps_convergence_gpu: ψ''(x) = 1 - 2x², ψ(0)=ψ(1)=0  [GPU kernel f32]");
-    println!("   {:>4}  {:>12}  {:>12}  {:>8}", "N", "dx", "avg_error", "order");
-
-    for &n in grid_sizes {
-        let dx = 1.0 / (n - 1) as f64;
+    for &n_elem in n_elements {
+        let n = n_elem + 1;
+        let dx = 1.0 / n_elem as f64;
         dxs.push(dx);
 
-        let source_f32: Vec<f32> = (0..n).map(|i| source_fn(i as f64 * dx) as f32).collect();
+        let source_f32: Vec<f32> = (0..n).map(|i| hakim_source_fn(i as f64 * dx) as f32).collect();
         let source_dev = DeviceBuffer::from_host(&stream, &source_f32).unwrap();
         let mut pot_dev = DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
 
-        module.solve_poisson_dps_flexible(
-            &stream, cfg,
-            &source_dev, &mut pot_dev,
-            n as u32, 0.0f32, 0.0f32, dx as f32,
-        ).unwrap();
+        module
+            .solve_poisson_dps_flexible(&stream, cfg, &source_dev, &mut pot_dev, n as u32, 0.0f32, 0.0f32, dx as f32)
+            .unwrap();
 
         let pot_gpu = pot_dev.to_host_vec(&stream).unwrap();
 
-        let mut file = fs::File::create(format!("results/dps_gpu_N{}.csv", n)).unwrap();
-        writeln!(file, "x,psi_num,psi_exact").unwrap();
-        for i in 0..n {
-            let x = i as f64 * dx;
-            writeln!(file, "{:.15e},{:.15e},{:.15e}", x, pot_gpu[i] as f64, exact_fn(x)).unwrap();
+        if n_elem == 16 {
+            let mut f = fs::File::create("results/hakim_n16_profile.csv").unwrap();
+            writeln!(f, "x,psi_numerical,psi_exact").unwrap();
+            for i in 0..n {
+                let x = i as f64 * dx;
+                writeln!(f, "{:.10e},{:.10e},{:.10e}", x, pot_gpu[i] as f64, hakim_exact_fn(x)).unwrap();
+            }
         }
 
         let mut err_sum = 0.0f64;
         for i in 1..(n - 1) {
             let x = i as f64 * dx;
-            err_sum += (pot_gpu[i] as f64 - exact_fn(x)).abs();
+            err_sum += (pot_gpu[i] as f64 - hakim_exact_fn(x)).abs();
         }
         let avg_err = err_sum / (n - 2) as f64;
         errors.push(avg_err);
 
-        let order = if errors.len() >= 2 {
-            (errors[errors.len() - 2] / errors[errors.len() - 1]).ln()
-                / (dxs[dxs.len() - 2] / dxs[dxs.len() - 1]).ln()
-        } else { 0.0 };
-
-        if errors.len() >= 2 {
-            println!("   {:>4}  {:>12.6e}  {:>12.6e}  {:>8.4}", n, dx, avg_err, order);
+        let order_str = if errors.len() >= 2 {
+            let order = (errors[errors.len() - 2] / errors[errors.len() - 1]).ln()
+                / (dxs[dxs.len() - 2] / dxs[dxs.len() - 1]).ln();
+            format!("{:.4}", order)
         } else {
-            println!("   {:>4}  {:>12.6e}  {:>12.6e}  {:>8}", n, dx, avg_err, "---");
-        }
-    }
+            "---".to_string()
+        };
 
-    let final_order = (errors[errors.len() - 2] / errors[errors.len() - 1]).ln()
-        / (dxs[dxs.len() - 2] / dxs[dxs.len() - 1]).ln();
-
-    let mut test_errors = 0;
-    for i in 1..errors.len() {
-        if errors[i] >= errors[i - 1] { test_errors += 1; }
+        println!("   {:>6}  {:>12.5e}  {:>14.6e}  {:>10}", n_elem, dx, avg_err, order_str);
     }
-    if final_order < 1.8 { test_errors += 1; }
-    if errors[errors.len() - 1] > 1e-4 { test_errors += 1; }
-
-    if test_errors > 0 {
-        println!("test_dps_convergence_gpu: FAILED ({} assertions)", test_errors);
-        std::process::exit(1);
-    }
-    println!("   → PASSED (order={:.4}), files written to results/dps_gpu_N*.csv", final_order);
 }
