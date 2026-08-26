@@ -1275,6 +1275,24 @@ mod kernels {
             a.fetch_add(1, AtomicOrdering::Relaxed);
         }
     }
+
+    #[kernel]
+    pub fn xoshiro128p_test_wrapper(
+        s0: u32,
+        s1: u32,
+        s2: u32,
+        s3: u32,
+        mut dest: DisjointSlice<u32>,
+    ) {
+        let (result, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
+        unsafe {
+            *dest.get_unchecked_mut(0) = result;
+            *dest.get_unchecked_mut(1) = ns0;
+            *dest.get_unchecked_mut(2) = ns1;
+            *dest.get_unchecked_mut(3) = ns2;
+            *dest.get_unchecked_mut(4) = ns3;
+        }
+    }
 }
 
 // Host-side initialization helpers
@@ -1736,6 +1754,7 @@ fn perform_checks() -> Result<(), Box<dyn std::error::Error>> {
 
 fn perform_tests() {
     test_gpu_dps_convergence_hakim();
+    test_gpu_xoshiro();
     std::process::exit(0);
 }
 
@@ -1808,5 +1827,88 @@ fn test_gpu_dps_convergence_hakim() {
         };
 
         println!("   {:>6}  {:>12.5e}  {:>14.6e}  {:>10}", n_elem, dx, avg_err, order_str);
+    }
+}
+
+use std::path::Path;
+
+fn load_c_xoshiro_result(path: &Path) -> Vec<u32> {
+    let text = fs::read_to_string(path).unwrap();
+    let mut values = Vec::new();
+    for (line_no, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: u32 = line
+            .parse()
+            .map_err(|e| format!("10000-c.txt:{}: invalid u32 '{}': {}", line_no + 1, line, e))
+            .unwrap();
+        values.push(v);
+    }
+    values
+}
+
+fn test_gpu_xoshiro() {
+    let c_res = load_c_xoshiro_result(Path::new("xorshiro128c/10000-c.txt"));
+    let n = c_res.len();
+    println!("loaded {} reference values from 10000-c.txt", n);
+
+    let (mut s0, mut s1, mut s2, mut s3) = (1, 1, 1, 1);
+
+    let ctx = CudaContext::new(0).expect("Failed to create CUDA context (no GPU?)");
+    let stream = ctx.default_stream();
+    let module = kernels::load(&ctx).expect("Failed to load CUDA module");
+    let mut dest = DeviceBuffer::<u32>::zeroed(&stream, 5).expect("Failed to create device buffer");
+    let mut dest_host = vec![0u32; 5];
+
+    // one block of one thread.
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut results = vec![0u32; n];
+
+    for i in 0..n {
+        module.xoshiro128p_test_wrapper(&stream, cfg, s0, s1, s2, s3, &mut dest).expect("Failed to launch CUDA kernel");
+        dest_host = dest.to_host_vec(&stream).expect("Failed to copy device buffer to host");
+        results[i] = dest_host[0];
+        s0 = dest_host[1];
+        s1 = dest_host[2];
+        s2 = dest_host[3];
+        s3 = dest_host[4];
+    }
+
+    let mut first_mismatch: Option<usize> = None;
+    for i in 0..n {
+        if results[i] != c_res[i] {
+            first_mismatch = Some(i);
+            break;
+        }
+    }
+
+    match first_mismatch {
+        None => {
+            println!(
+                "OK: GPU kernel matches C reference bit-for-bit for all {} values",
+                n
+            );
+
+            let dir_path = format!("results/xoshiro128p_test");
+            fs::create_dir_all(&dir_path).expect("Unable to create directory");
+            let filename = format!("{}/gpu_to_c_res.csv", dir_path);
+
+            let mut file = File::create(&filename).expect("Unable to create file");
+            writeln!(file, "gpu,c").expect("Unable to write header");
+
+            for (step, (&gpu_val, &c_val)) in results.iter().zip(c_res.iter()).enumerate() {
+                writeln!(file, "{},{}", gpu_val, c_val).expect("Unable to write row");
+            }
+        }
+        Some(i) => {
+            println!("xoshiro128+ GPU kernel diverged from reference at index {}", i);
+        }
     }
 }
