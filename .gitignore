@@ -1,0 +1,6 @@
+target/
+.oxide-artifacts/
+*.ll
+*.ptx
+results/
+*.nsys-rep

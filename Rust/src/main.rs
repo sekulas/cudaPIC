@@ -98,6 +98,8 @@ const DE_FED: f64          = 1.0;                    // resolution of FEDs (EFED
 const N_BIN: u32           = 20;                     // number of time steps binned for the XT distributions
 const N_XT: usize          = (N_T / N_BIN) as usize; // number of spatial bins for the XT distributions
 
+const CHECKPOINT_CYCLES: usize = 100;
+
 // structure type definitions
 
 #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
@@ -246,12 +248,6 @@ fn main(){
         println!(">> eduPIC: Running {} cycles...",cycle);
         for c in 1..=cycle{
             for t in 0..N_T{
-                if t%1000==0{
-                    println!(
-                        "c = {:8}  t = {:8}  #e = {:8}  #i = {:8}",
-                        cycles_done+c, t, Electrons.len(), Ions.len() );
-                }
-
                 get_density(&mut e_density, &mut cumul_e_density, &mut Electrons);
                 if t % N_SUB == 0 { get_density(&mut i_density, &mut cumul_i_density, &mut Ions); }
 
@@ -334,7 +330,12 @@ fn main(){
                     }
                 }
             }
-            writeln!(conv_file, "{:10}   {:10}   {:10}", cycles_done+c, Electrons.len(), Ions.len()).map_err(|err| println!("{:?}", err)).ok();
+            let current_cycle = cycles_done + c;
+            if(current_cycle % CHECKPOINT_CYCLES == 0) {
+                println!("   checkpoint at cycle {}: n_e={}, n_i={}, time={:.3}s", current_cycle, 
+                    Electrons.len(), Ions.len(), start.elapsed().as_secs_f64());
+            }
+            writeln!(conv_file, "{:10}   {:10}   {:10} ", current_cycle, Electrons.len(), Ions.len(), ).map_err(|err| println!("{:?}", err)).ok();
         }
         cycles_done += cycle;
         N_e = Electrons.len();
