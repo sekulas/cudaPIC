@@ -16,13 +16,15 @@ use rand_distr::Normal;
 use std::{env, fmt};
 use std::time::Instant;
 use std::io::BufWriter;
+use std::fs::{self, File};
+use std::io::Write;
+use chrono::{DateTime, Utc};
+use chrono_tz::Europe::Warsaw;
+use chrono_tz::Tz;
 
-
-/// TODO - Simulation precision: change to f32 for single-precision GPU computation.
 type Real = f32;
 
 // constants
-
 const PI: f64              = 3.141592653589793;      // mathematical constant Pi
 const TWO_PI: f64          = 2.0 * PI;               // two times Pi
 const E_CHARGE: f64        = 1.60217662e-19;         // electron charge [C]
@@ -30,11 +32,10 @@ const EV_TO_J: f64         = E_CHARGE;               // eV <-> Joule conversion 
 const E_MASS: f64          = 9.10938356e-31;         // mass of electron [kg]
 const AR_MASS: f64         = 6.63352090e-26;         // mass of argon atom [kg]
 const MU_ARAR: f64         = AR_MASS / 2.0;          // reduced mass of two argon atoms [kg]
-const K_BOLTZMANN: f64     = 1.38064852e-23;         // Boltzmann's constant [J/K]
+const K_BOLTZMANN: f64     = 1.38064852e-23;         // boltzmann's constant [J/K]
 const EPSILON0: f64        = 8.85418781e-12;         // permittivity of free space [F/m]
 
-// simulation parameters
-
+// simulation parameters        
 const N_G: usize           = 400;                    // number of grid points
 const N_T: u32             = 4000;                   // time steps within an RF period
 const FREQUENCY: f64       = 13.56e6;                // driving frequency [Hz]
@@ -47,7 +48,6 @@ const ELECTRODE_AREA: f64  = 1.0e-4;                 // (fictive) electrode area
 const N_INIT: usize        = 1000;                   // number of initial electrons and ions
 
 // additional (derived) constants
-
 const PERIOD: f64          = 1.0 / FREQUENCY;                          // RF period length [s]
 const DT_E: f64            = PERIOD / (N_T as f64);                    // electron time step [s]
 const N_SUB: u32           = 20;                                       // ions move only in these cycles (subcycling)
@@ -58,7 +58,6 @@ const GAS_DENSITY: f64     = PRESSURE / (K_BOLTZMANN * TEMPERATURE);   // backgr
 const OMEGA: f64           = TWO_PI * FREQUENCY;                       // angular frequency [rad/s]
 
 // electron and ion cross sections
-
 const N_CS: usize          = 5;                      // total number of processes / cross sections
 const E_ELA: usize         = 0;                      // process identifier: electron/elastic
 const E_EXC: usize         = 1;                      // process identifier: electron/excitation
@@ -71,7 +70,6 @@ const CS_RANGES: usize     = 1_000_000;              // number of entries in cro
 const DE_CS: f64           = 0.001;                  // energy division in cross section arrays [eV]
 
 // measurement conditions
-
 const MIN_X: f64           = 0.45 * L;               // lower limit of central region
 const MAX_X: f64           = 0.55 * L;               // upper limit of central region
 const N_EEPF: usize        = 2000;                   // number of energy bins in Electron Energy Probability Function (EEPF)
@@ -81,55 +79,42 @@ const DE_FED: f64          = 1.0;                    // resolution of FEDs (EFED
 const N_BIN: u32           = 20;                     // number of time steps binned for the XT distributions
 const N_XT: usize          = (N_T / N_BIN) as usize; // number of spatial bins for the XT distributions
 
-// GPU capacity & allocation constants
+// gpu capacity and allocation constants
+const MAX_PARTICLES: usize = 120_000;                       // maximum number of particles per species (pre-allocated on GPU).
+const FACTOR_E: f64 = DT_E / E_MASS * (-E_CHARGE);          // leapfrog acceleration factor for electrons
+const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;            // leapfrog acceleration factor for ions
+const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);  // weight factor for density deposition
 
-const MAX_PARTICLES: usize = 120_000;                // maximum number of particles per species (pre-allocated on GPU).
-const MAX_PARTICLES_U32: u32 = MAX_PARTICLES as u32; // used for LaunchConfig::for_num_elems
-const N_SPECIES: usize        = 2;                    // electrons + ions
-const PARTICLE_COMPS: usize   = 4;                    // arrays per species: x, vx, vy, vz
-const N_GRID_ARRAYS: usize    = 5;                    // efield, pot, rho, e_density, i_density
-const SIZEOF_REAL: usize      = std::mem::size_of::<Real>();  // adapts to Real precision
-const BYTES_PER_MB: f64       = 1_048_576.0;          // 1024 × 1024
-
-const FACTOR_E: f64 = DT_E / E_MASS * (-E_CHARGE);  // leapfrog acceleration factor for electrons [m/s per (V/m)]
-const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;    // leapfrog acceleration factor for ions [m/s per (V/m)]
-const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);
-
-// block must have ≥ N_G threads so each thread owns one grid point
-// next multiple of 32 above N_G=400 is 416
-const POISSON_SCAN_BLOCK_SIZE: u32   = 416;                             // 13 warps, covers N_G=400
-const POISSON_SCAN_NUM_WARPS:  usize = POISSON_SCAN_BLOCK_SIZE as usize / 32;   
-
-// check_boundaries stream compaction: per-block prefix scan + 1 atomicAdd/block.
-// Block size is fixed at 512 (16 warps)
-const COMPACT_BLOCK_SIZE: u32   = 512;
-const COMPACT_NUM_WARPS:  usize = COMPACT_BLOCK_SIZE as usize / 32;   // = 16
+// kernel launch parameters
+const MAX_PARTICLES_U32: u32 = MAX_PARTICLES as u32;                            // particle base for kernel launch param
+const POISSON_SCAN_BLOCK_SIZE: u32   = 416;                                     // size of block for poisson kernel 
+const POISSON_SCAN_NUM_WARPS:  usize = POISSON_SCAN_BLOCK_SIZE as usize / 32;   // amount of warps in block for poisson kernel
+const COMPACT_BLOCK_SIZE: u32   = 512;                                          // size of block for stream compaction kernel
+const COMPACT_NUM_WARPS:  usize = COMPACT_BLOCK_SIZE as usize / 32;             // amount of warps in block for stream compaction kernel
 
 // collisions
-const NORMAL_RANGE: Real = 269.90040554976775; // (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt();  // thermal velocity of background gas [m/s]
-const F1: Real = (E_MASS / (E_MASS + AR_MASS)) as Real;
-const F2: Real = (AR_MASS / (E_MASS + AR_MASS)) as Real;
-const LOG2_E: Real = 1.4426950408889634; // log2(e)
+const NORMAL_RANGE: Real = 269.90040554976775;                                // thermal velocity of background gas
+const F1: Real = (E_MASS / (E_MASS + AR_MASS)) as Real;                       // precomputed factor
+const F2: Real = (AR_MASS / (E_MASS + AR_MASS)) as Real;                      // precomputed factor
+const HALF_E_MASS_OVER_E_CHARGE: Real = (0.5 * E_MASS / E_CHARGE) as Real;    // precomputed factor
+const HALF_MU_ARAR_OVER_E_CHARGE: Real = (0.5 * MU_ARAR / E_CHARGE) as Real;  // precomputed factor
+const LOG2_E: Real = 1.4426950408889634;                                      // log2(e)
 
-// precomputed
-const HALF_E_MASS_OVER_E_CHARGE: Real = (0.5 * E_MASS / E_CHARGE) as Real;
-const HALF_MU_ARAR_OVER_E_CHARGE: Real = (0.5 * MU_ARAR / E_CHARGE) as Real;
-const HALF_INV_DX_F: Real = (0.5 * INV_DX) as Real;
-
-// poisson solver constants (f32 for kernel)
-const ALPHA_F: f32 = (-DX * DX / EPSILON0) as f32;
-const E_CHARGE_F: f32 = E_CHARGE as f32;
-const INV_DX_F: f32 = INV_DX as f32;
-const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32;
-
+// poisson solver
+const E_CHARGE_F: f32 = E_CHARGE as f32;                         // f32 electron charge
+const INV_DX_F: f32 = INV_DX as f32;                             // f32 inverse of spatial grid size
+const ALPHA_F: f32 = (-DX * DX / EPSILON0) as f32;               // precomputed factor
+const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32;  // precomputed factor
+const HALF_INV_DX_F: Real = (0.5 * INV_DX) as Real;              // precomputed factor             
+        
 // measurments
-const MIN_X_F: Real = MIN_X as Real;
-const MAX_X_F: Real = MAX_X as Real;
-const DE_EEPF_F: Real = DE_EEPF as Real;
+const MIN_X_F: Real = MIN_X as Real;        // f32 lower limit of central region
+const MAX_X_F: Real = MAX_X as Real;        // f32 upper limit of central region
+const DE_EEPF_F: Real = DE_EEPF as Real;    // f32 resolution of EEPF
+const CHECKPOINT_CYCLES: usize = 100;       // cycles to retrieve number of particles from gpu
 
-// SoA particle data - host-side representation
-
-struct ParticlesSoA {                                // Host-side SoA container for particle data.
+// host side particle data container
+struct ParticlesSoA {
     x:  Vec<Real>,
     vx: Vec<Real>,
     vy: Vec<Real>,
@@ -145,15 +130,9 @@ impl ParticlesSoA {
             vz: vec![0.0 as Real; cap],
         }
     }
-
-    /// Return how many particles are currently valid (based on actual data length).
-    fn len(&self) -> usize {
-        self.x.len()
-    }
 }
 
-// GPU buffer collection - all device-resident data
-
+// gpu simulation state data
 struct GpuSimState {
     // electron particle arrays (pre-allocated to MAX_PARTICLES)
     e_x:  DeviceBuffer<Real>,
@@ -167,29 +146,24 @@ struct GpuSimState {
     i_vy: DeviceBuffer<Real>,
     i_vz: DeviceBuffer<Real>,
 
-    // active particle counters (atomic on GPU)
-    // pattern: pass as &[u32] to kernel, cast to DeviceAtomicU32 inside.
-    // ionization appends directly to main arrays via atomicAdd on these counters.
-    n_electrons: DeviceBuffer<u32>,  // n_electrons[0] = active electron count
-    n_ions:      DeviceBuffer<u32>,  // n_ions[0] = active ion count
+    // particle counters
+    n_electrons: DeviceBuffer<u32>,
+    n_ions:      DeviceBuffer<u32>,
 
-    // grid quantities (fixed size N_G = 400)
-    efield:    DeviceBuffer<Real>,    // electric field [V/m]
-    pot:       DeviceBuffer<Real>,    // electric potential [V]
-    rho:       DeviceBuffer<Real>,    // charge density [C/m³]
-    e_density: DeviceBuffer<Real>,    // electron density [m⁻³]
-    i_density: DeviceBuffer<Real>,    // ion density [m⁻³]
+    // grid
+    efield:    DeviceBuffer<Real>,
+    pot:       DeviceBuffer<Real>,
+    e_density: DeviceBuffer<Real>,
+    i_density: DeviceBuffer<Real>,
 
-    // cross sections (read-only after upload, 5 × CS_RANGES entries)
-    // flattened 2D: cs[process][energy_index] → cs[process * CS_RANGES + energy_index]
+    // cross sections
     cs: DeviceBuffer<Real>,
 
     // total cross sections
-    // stores Σσ(E) × n_gas
-    sigma_tot_e: DeviceBuffer<Real>,  // [CS_RANGES]
-    sigma_tot_i: DeviceBuffer<Real>,  // [CS_RANGES]
+    sigma_tot_e: DeviceBuffer<Real>,
+    sigma_tot_i: DeviceBuffer<Real>,
 
-    // RNG state per-particle
+    // rng state
     rng_e0: DeviceBuffer<u32>,
     rng_e1: DeviceBuffer<u32>,
     rng_e2: DeviceBuffer<u32>,
@@ -199,13 +173,13 @@ struct GpuSimState {
     rng_i2: DeviceBuffer<u32>,
     rng_i3: DeviceBuffer<u32>,
 
-    // double-buffer pattern for check_boundaries stream compaction
+    // buffers for stream compaction
     tmp_x:  DeviceBuffer<Real>,
     tmp_vx: DeviceBuffer<Real>,
     tmp_vy: DeviceBuffer<Real>,
     tmp_vz: DeviceBuffer<Real>,
 
-    // alive counter for stream compaction
+    // tmp var to store data about particle counts
     alive_counter: DeviceBuffer<u32>,
 
     // measurments
@@ -215,10 +189,8 @@ struct GpuSimState {
 }
 
 impl GpuSimState {
-    // allocate all GPU buffers (zeroed)
     fn allocate(stream: &cuda_core::CudaStream, measure: bool) -> Result<Self, cuda_core::DriverError> {
         Ok(Self {
-            // particle arrays
             e_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             e_vx: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             e_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
@@ -229,26 +201,19 @@ impl GpuSimState {
             i_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             i_vz: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
 
-            // atomic counters
             n_electrons: DeviceBuffer::<u32>::zeroed(stream, 1)?,
             n_ions:      DeviceBuffer::<u32>::zeroed(stream, 1)?,
 
-            // grid arrays
             efield:    DeviceBuffer::<Real>::zeroed(stream, N_G)?,
             pot:       DeviceBuffer::<Real>::zeroed(stream, N_G)?,
-            rho:       DeviceBuffer::<Real>::zeroed(stream, N_G)?,
             e_density: DeviceBuffer::<Real>::zeroed(stream, N_G)?,
             i_density: DeviceBuffer::<Real>::zeroed(stream, N_G)?,
 
-            // cross sections: flattened [N_CS × CS_RANGES]
             cs: DeviceBuffer::<Real>::zeroed(stream, N_CS * CS_RANGES)?,
 
-            // total cross sections
             sigma_tot_e: DeviceBuffer::<Real>::zeroed(stream, CS_RANGES)?,
             sigma_tot_i: DeviceBuffer::<Real>::zeroed(stream, CS_RANGES)?,
 
-            // RNG state: 4 × u32 per particle
-            // TODO xoshiro128+ - verify
             rng_e0: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
             rng_e1: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
             rng_e2: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
@@ -258,12 +223,12 @@ impl GpuSimState {
             rng_i2: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
             rng_i3: DeviceBuffer::<u32>::zeroed(stream, MAX_PARTICLES)?,
 
-            // tmp buffers for stream compaction
+            alive_counter: DeviceBuffer::<u32>::zeroed(stream, 1)?,
+
             tmp_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             tmp_vx: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             tmp_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             tmp_vz: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
-            alive_counter: DeviceBuffer::<u32>::zeroed(stream, 1)?,
 
             cumul_e_density: if measure {
                 DeviceBuffer::<f64>::zeroed(stream, N_G)?
@@ -283,8 +248,6 @@ impl GpuSimState {
         })
     }
 
-    // upload initial particle data from host.
-    // only positions up to `n_active` are valid; rest stays zeroed.
     fn upload_electrons(
         &mut self,
         stream: &cuda_core::CudaStream,
@@ -315,13 +278,12 @@ impl GpuSimState {
         Ok(())
     }
 
-    // upload cross section tables (flattened 2D) and total cross sections
     fn upload_cross_sections(
         &mut self,
         stream: &cuda_core::CudaStream,
-        cs_flat: &[Real],        // [N_CS * CS_RANGES]
-        sigma_tot_e: &[Real],    // [CS_RANGES]
-        sigma_tot_i: &[Real],    // [CS_RANGES]
+        cs_flat: &[Real],       
+        sigma_tot_e: &[Real],
+        sigma_tot_i: &[Real],
     ) -> Result<(), cuda_core::DriverError> {
         self.cs.copy_from_host(stream, cs_flat)?;
         self.sigma_tot_e.copy_from_host(stream, sigma_tot_e)?;
@@ -329,7 +291,6 @@ impl GpuSimState {
         Ok(())
     }
 
-    // upload RNG seeds
     fn upload_rng_state(
         &mut self,
         stream: &cuda_core::CudaStream,
@@ -352,7 +313,6 @@ impl GpuSimState {
         Ok(())
     }
 
-    // download electron data back to host
     fn download_electrons(
         &self,
         stream: &cuda_core::CudaStream,
@@ -366,7 +326,6 @@ impl GpuSimState {
         Ok((ParticlesSoA { x, vx, vy, vz }, n[0]))
     }
 
-    // download ion data back to host
     fn download_ions(
         &self,
         stream: &cuda_core::CudaStream,
@@ -391,8 +350,6 @@ impl GpuSimState {
     }
 }
 
-// GPU Kernels
-
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -415,7 +372,7 @@ mod kernels {
         }
         thread::sync_threads();
 
-        // Charge to shared histogram | Block-scope atomics
+        // shared mem
         let i = thread::index_1d().get();
         if i < n_active[0] as usize {
             let pos = x[i] * INV_DX as Real;
@@ -434,7 +391,7 @@ mod kernels {
         }
         thread::sync_threads();
 
-        // Flush to global density | Device-scope atomics
+        // global mem flush
         let global_density = density.as_ptr() as *const DeviceAtomicF32;
         let mut k = tid;
         while k < N_G {
@@ -543,7 +500,7 @@ mod kernels {
     pub fn solve_poisson_dps_flexible(
         source:    &[f32],              
         mut pot:   DisjointSlice<f32>,  
-        n:         u32,                 // number of grid points (with boundaries)
+        n:         u32,
         psi_left:  f32,                 
         psi_right: f32,                 
         dx:        f32,
@@ -614,7 +571,7 @@ mod kernels {
         mut dst_vx: DisjointSlice<Real>,
         mut dst_vy: DisjointSlice<Real>,
         mut dst_vz: DisjointSlice<Real>,
-        alive_counter: &[u32],   // global alive count (MUST be zeroed before launch)
+        alive_counter: &[u32],
         n_active:      &[u32],
         factor:   Real,
         dt:       Real,
@@ -631,6 +588,7 @@ mod kernels {
         let (mut new_x, mut new_vx, mut vyi, mut vzi): (Real, Real, Real, Real) =
             (0.0, 0.0, 0.0, 0.0);
 
+        // move
         if i < n_active[0] as usize {
             let xi  = src_x[i];
             let vxi = src_vx[i];
@@ -650,6 +608,7 @@ mod kernels {
             }
         }
 
+        // compact
         let mask        = warp::ballot(flag);
         let lane_offset = (mask & warp::lanemask_lt()).count_ones();
         let warp_total  = mask.count_ones();
@@ -762,7 +721,6 @@ mod kernels {
         result
     }
 
-    /// 2^x
     #[inline(always)]
     fn ptx_ex2(x: Real) -> Real {
         let result: Real;
@@ -777,7 +735,6 @@ mod kernels {
         result
     }
 
-    /// log2(x)
     #[inline(always)]
     fn ptx_lg2(x: Real) -> Real {
         let result: Real;
@@ -792,7 +749,6 @@ mod kernels {
         result
     }
 
-    /// 1/x
     #[inline(always)]
     fn ptx_rcp(x: Real) -> Real {
         let result: Real;
@@ -807,13 +763,11 @@ mod kernels {
         result
     }
 
-    /// 2^(x * log2(e))
     #[inline(always)]
     fn ptx_exp(x: Real) -> Real {
         ptx_ex2(x * LOG2_E)
     }
 
-    /// sin(x) / cos(x)
     #[inline(always)]
     fn ptx_tan(x: Real) -> Real {
         let s = ptx_sin(x);
@@ -821,54 +775,43 @@ mod kernels {
         s * ptx_rcp(c)
     }
 
-    /// for |x| > 1, atan(x) = pi/2 - atan(1/x)
+    #[inline(always)]
+    fn ptx_atan_poly(z: Real) -> Real {
+        let z2 = z * z;
+        ((-0.0464964749 * z2 + 0.15931422) * z2 - 0.327622764) * z2 * z + z
+    }
+
     #[inline(always)]
     fn ptx_atan(x: Real) -> Real {
-        let ax = if x < 0.0 { -x } else { x };
+        let ax = ptx_abs(x);
         let swap = ax > 1.0;
         let z = if swap { ptx_rcp(ax) } else { ax };
 
-        let z2 = z * z;
-        let mut r = -0.0464964749;
-        r = r * z2 + 0.15931422;
-        r = r * z2 - 0.327622764;
-        r = r * z2 + 0.999847695;
-        r = r * z;
-
+        let mut r = ptx_atan_poly(z);
         if swap {
             r = (0.5 * PI as Real) - r;
         }
         if x < 0.0 { -r } else { r }
     }
 
+    // https://math.stackexchange.com/a/1105038
     #[inline(always)]
     fn ptx_atan2(y: Real, x: Real) -> Real {
-        let ax = if x < 0.0 { -x } else { x };
-        let ay = if y < 0.0 { -y } else { y };
+        let ax = ptx_abs(x);
+        let ay = ptx_abs(y);
 
-        if ax < 1e-30 && ay < 1e-30 {
-            return 0.0;
-        }
+        let a = if ay > ax { ax * ptx_rcp(ay) } else { ay * ptx_rcp(ax) };
+        let mut r = ptx_atan_poly(a);
 
-        let a: Real;
-        let swap = ay > ax;
-        if swap {
-            a = ptx_atan(ax * ptx_rcp(ay));
-        } else {
-            a = ptx_atan(ay * ptx_rcp(ax));
-        }
-
-        let r = if swap { (0.5 * PI as Real) - a } else { a };
-        let r = if x < 0.0 { PI as Real - r } else { r };
+        if ay > ax { r = (0.5 * PI as Real) - r; }
+        if x < 0.0 { r = PI as Real - r; }
         if y < 0.0 { -r } else { r }
     }
 
-    /// atan2(sqrt(1 - x*x), x)
     #[inline(always)]
     fn ptx_acos(x: Real) -> Real {
-        let clamped = if x > 1.0 { 1.0 } else if x < -1.0 { -1.0 } else { x };
-        let s = ptx_sqrt(ptx_abs(1.0 - clamped * clamped));
-        ptx_atan2(s, clamped)
+        let s = ptx_sqrt(ptx_abs(1.0 - x * x));
+        ptx_atan2(s, x)
     }
 
     #[inline(always)]
@@ -946,7 +889,6 @@ mod kernels {
         let (r3, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
         s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
 
-        // fourth random for Box-Muller, but not used
         let (r4, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
         
         unsafe {
@@ -990,8 +932,11 @@ mod kernels {
             return;
         } 
 
-        let v2 = unsafe { *vx.get_unchecked_mut(i) * *vx.get_unchecked_mut(i) + *vy.get_unchecked_mut(i) * *vy.get_unchecked_mut(i) + *vz.get_unchecked_mut(i) * *vz.get_unchecked_mut(i) };
-        let energy: Real = HALF_E_MASS_OVER_E_CHARGE * v2; // EV_TO_J
+        let v2 = unsafe { *vx.get_unchecked_mut(i) * *vx.get_unchecked_mut(i) 
+            + *vy.get_unchecked_mut(i) * *vy.get_unchecked_mut(i) 
+            + *vz.get_unchecked_mut(i) * *vz.get_unchecked_mut(i) 
+        };
+        let energy: Real = HALF_E_MASS_OVER_E_CHARGE * v2;
         let c1 = (energy / (DE_CS as Real) + 0.5) as usize;
         let c2 = CS_RANGES - 1;
 
@@ -1020,7 +965,6 @@ mod kernels {
         let wy: Real = F1 * unsafe { *vy.get_unchecked_mut(i) };
         let wz: Real = F1 * unsafe { *vz.get_unchecked_mut(i) };
 
-        // cross-section lookup using energy_index
         let t0: Real = cs[E_ELA * CS_RANGES + energy_index];
         let t1: Real = t0 + cs[E_EXC * CS_RANGES + energy_index];
         let t2: Real = t1 + cs[E_ION * CS_RANGES + energy_index];
@@ -1052,16 +996,16 @@ mod kernels {
         let cp: Real = ptx_cos(phi);
 
         let rnd = rng_next_f32(i, rng0, rng1, rng2, rng3);
-        if rnd < t0 / t2 {  // elastic scattering
+        if rnd < t0 / t2 {                                                      // elastic scattering
             chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
             eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
-        } else if rnd < t1 / t2 {  // excitation
+        } else if rnd < t1 / t2 {                                               // excitation
             let mut energy = 0.5 * E_MASS as Real * g * g;
             energy = ptx_abs(energy - E_EXC_TH as Real * E_CHARGE as Real);
             g = ptx_sqrt(2.0 as Real * energy / E_MASS as Real);
             chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
             eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
-        } else {  // ionization
+        } else {                                                                // ionization
             let mut energy = 0.5 * E_MASS as Real * g * g;
             energy = ptx_abs(energy - E_ION_TH as Real * E_CHARGE as Real);
             let e_new = 10.0 as Real * ptx_tan(rng_next_f32(i, rng0, rng1, rng2, rng3) * ptx_atan(energy / E_CHARGE as Real/20.0)) * E_CHARGE as Real;
@@ -1295,8 +1239,7 @@ mod kernels {
     }
 }
 
-// Host-side initialization helpers
-
+// host side init helpers
 fn init_particles(n: usize) -> ParticlesSoA {
     let mut rng = rand::rng();
     let sigma_v = (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt();
@@ -1416,7 +1359,7 @@ fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
     streams
 }
 
-
+// host side data saving helpers 
 enum ParticleSpecies {
     Electrons = 0,
     Ions      = 1,
@@ -1431,18 +1374,11 @@ impl fmt::Display for ParticleSpecies {
     }
 }
 
-
-use std::fs::{self, File};
-use std::io::Write;
-use chrono::{DateTime, Utc};
-use chrono_tz::Europe::Warsaw;
-use chrono_tz::Tz;
-
 fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, species: ParticleSpecies, tsmp: DateTime<Tz>) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
 
     let dir_path = format!("results/{}", time_stamp);
-    fs::create_dir_all(&dir_path).expect("Unable to create directory");
+    fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/{:04}_{}_{}.csv", dir_path, step, time_stamp, species);
 
     let mut file = File::create(&filename).expect("unable to create file");
@@ -1460,30 +1396,28 @@ fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, spec
     }
 }
 
-const CHECKPOINT_CYCLES: usize = 100;
-
 fn save_particle_growth_data(n_e: Vec<u32>, n_i: Vec<u32>, tsmp: DateTime<Tz>) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
 
     let dir_path = format!("results/{}", time_stamp);
-    fs::create_dir_all(&dir_path).expect("Unable to create directory");
+    fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/particle_growth_{}.csv", dir_path, time_stamp);
 
-    let mut file = File::create(&filename).expect("Unable to create file");
-    writeln!(file, "step,n_e,n_i").expect("Unable to write header");
+    let mut file = File::create(&filename).expect("unable to create file");
+    writeln!(file, "step,n_e,n_i").expect("unable to write header");
 
     for (step, (&n_e_val, &n_i_val)) in n_e.iter().zip(n_i.iter()).enumerate() {
-        writeln!(file, "{},{},{}", step*CHECKPOINT_CYCLES, n_e_val, n_i_val).expect("Unable to write particle growth data");
+        writeln!(file, "{},{},{}", step*CHECKPOINT_CYCLES, n_e_val, n_i_val).expect("unable to write particle growth data");
     }
 }
 
 fn save_density_avg(cumul_e: &[f64], cumul_i: &[f64], n_steps_e: f64, n_steps_i: f64, tsmp: DateTime<Tz>) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
     let dir_path = format!("results/{}", time_stamp);
-    fs::create_dir_all(&dir_path).expect("Unable to create directory");
+    fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/density_avg_{}.csv", dir_path, time_stamp);
 
-    let mut file = File::create(&filename).expect("Unable to create file");
+    let mut file = File::create(&filename).expect("unable to create file");
     writeln!(file, "x,n_e,n_i").expect("header");
     for k in 0..N_G {
         let x = k as f64 * DX as f64;
@@ -1503,7 +1437,7 @@ fn save_eepf(eepf_raw: &[u32], tsmp: DateTime<Tz>) {
     let mut file = File::create(&filename).expect("unable to create file");
     writeln!(file, "energy_eV,eepf").expect("header");
     for (i, &count) in eepf_raw.iter().enumerate() {
-        let e = (0.5 + i as f64) * DE_EEPF;           // center of the bin
+        let e = (0.5 + i as f64) * DE_EEPF;
         let val = count as f64 / h / e.sqrt();
         writeln!(file, "{},{}", e, val).expect("row");
     }
@@ -1529,39 +1463,40 @@ fn main() {
         num_cycles, measure, measurement_start_cycle);
 
     let start_init = Instant::now();
-    // 1. Initialize CUDA context
-    let ctx = CudaContext::new(0).expect("Failed to create CUDA context (no GPU?)");
+
+    // cuda context init
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context (no GPU?)");
     let stream = ctx.default_stream();
     println!(">> eduPIC-GPU: CUDA context initialized");
 
-    // 2. Compute cross-sections on CPU
+    // cpu cs precomputation
     let (cs_flat, sigma_tot_e, sigma_tot_i) = init_cross_sections();
     println!(">> eduPIC-GPU: cross-sections computed ({} entries per process)", CS_RANGES);
 
-    // 3. Initialize particles on CPU (SoA layout)
+    // cpu particle init
     let electrons_host = init_particles(N_INIT);
     let ions_host      = init_particles(N_INIT);
 
-    // 4. Allocate all GPU buffers
+    // gpu state allocation
     let mut gpu = GpuSimState::allocate(&stream, measure)
         .expect("failed to allocate GPU memory");
 
-    // 5. Upload data to GPU (one-time PCIe transfer)
+    // gpu data upload
     gpu.upload_electrons(&stream, &electrons_host, N_INIT as u32)
-        .expect("Failed to upload electrons");
+        .expect("failed to upload electrons");
     gpu.upload_ions(&stream, &ions_host, N_INIT as u32)
-        .expect("Failed to upload ions");
+        .expect("failed to upload ions");
     gpu.upload_cross_sections(&stream, &cs_flat, &sigma_tot_e, &sigma_tot_i)
-        .expect("Failed to upload cross-sections");
+        .expect("failed to upload cross-sections");
 
     let e_seeds = xoshiro128_seed_streams([0x1234_5678, 0x1111_2222, 0x2222_3333, 0x3333_4444], MAX_PARTICLES);
     let i_seeds = xoshiro128_seed_streams([0x4444_5555, 0x5555_6666, 0x6666_7777, 0x7777_8888], MAX_PARTICLES);
     gpu.upload_rng_state(&stream, &e_seeds, &i_seeds)
-        .expect("Failed to upload RNG state");
+        .expect("failed to upload RNG state");
 
     println!(">> eduPIC-GPU: data uploaded to GPU");
 
-    // 6. Launch configs
+    // launch configs definition
     let cfg = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
     let poisson_cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
@@ -1576,10 +1511,11 @@ fn main() {
     let acc_density_cfg = poisson_cfg;
     let eepf_cfg    = cfg;         
 
+    // pinned mem for particle count retrieval
     let mut h_counter_e = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
     let mut h_counter_i = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
 
-    // 7. GPU simulation loop
+    // simulation loop
     println!(">> eduPIC-GPU: running {} cycles x{} steps...", num_cycles, N_T);
     let module = kernels::load(&ctx).expect("Failed to load CUDA module");
 
@@ -1592,14 +1528,6 @@ fn main() {
 
     let cfg_e = cfg;
     let cfg_i = cfg;
-
-    match perform_checks() {
-        Ok(_) => println!(">> eduPIC-GPU: all checks passed"),
-        Err(e) => {
-            println!(">> eduPIC-GPU: check failed: {}", e);
-            std::process::exit(1);
-        }
-    }
 
     if measure {
         gpu.cumul_e_density.zero_async(&stream).expect("zero cumul_e_density");
@@ -1712,13 +1640,13 @@ fn main() {
         }
     }
 
-    // 8. Synchronize and download results
+    // synchronization and result gathering
     ctx.synchronize().expect("CUDA synchronization failed");
 
     let (_electrons_result, n_e_final) = gpu.download_electrons(&stream)
-        .expect("Failed to download electrons");
+        .expect("failed to download electrons");
     let (_ions_result, n_i_final) = gpu.download_ions(&stream)
-        .expect("Failed to download ions");
+        .expect("failed to download ions");
 
     let elapsed = start.elapsed().as_secs_f64();
     println!(">> eduPIC-GPU: simulation complete in {:.3} s", elapsed);
@@ -1731,7 +1659,7 @@ fn main() {
 
     if measure {
         let (cumul_e, cumul_i, eepf_raw) = gpu.download_measurements(&stream)
-            .expect("Failed to download measurements");
+            .expect("failed to download measurements");
 
         let n_steps_e = (measurement_cycles as f64 * N_T as f64) as f64;
         let n_steps_i = (measurement_cycles as f64 * (N_T as f64 / N_SUB as f64)) as f64;
@@ -1743,15 +1671,7 @@ fn main() {
     }
 }
 
-fn perform_checks() -> Result<(), Box<dyn std::error::Error>> {
-    if(POISSON_SCAN_BLOCK_SIZE < N_G as u32) {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "POISSON_SCAN_BLOCK_SIZE must be >= N_G")));
-    }
-    Ok(())
-}
-
 // tests
-
 fn perform_tests() {
     test_gpu_dps_convergence_hakim();
     test_gpu_xoshiro();
@@ -1850,19 +1770,20 @@ fn load_c_xoshiro_result(path: &Path) -> Vec<u32> {
 }
 
 fn test_gpu_xoshiro() {
+    println!("\n>> TEST: xoshiro to ref");
     let c_res = load_c_xoshiro_result(Path::new("xorshiro128c/10000-c.txt"));
     let n = c_res.len();
-    println!("loaded {} reference values from 10000-c.txt", n);
+    println!("  loaded {} reference values from 10000-c.txt", n);
 
     let (mut s0, mut s1, mut s2, mut s3) = (1, 1, 1, 1);
 
-    let ctx = CudaContext::new(0).expect("Failed to create CUDA context (no GPU?)");
+    let ctx = CudaContext::new(0).expect("failed to create cuda context");
     let stream = ctx.default_stream();
-    let module = kernels::load(&ctx).expect("Failed to load CUDA module");
-    let mut dest = DeviceBuffer::<u32>::zeroed(&stream, 5).expect("Failed to create device buffer");
+    let module = kernels::load(&ctx).expect("failed to load cuda module");
+    let mut dest = DeviceBuffer::<u32>::zeroed(&stream, 5).expect("failed to create device buffer");
     let mut dest_host = vec![0u32; 5];
 
-    // one block of one thread.
+    // one block of one thread
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (1, 1, 1),
@@ -1872,8 +1793,8 @@ fn test_gpu_xoshiro() {
     let mut results = vec![0u32; n];
 
     for i in 0..n {
-        module.xoshiro128p_test_wrapper(&stream, cfg, s0, s1, s2, s3, &mut dest).expect("Failed to launch CUDA kernel");
-        dest_host = dest.to_host_vec(&stream).expect("Failed to copy device buffer to host");
+        module.xoshiro128p_test_wrapper(&stream, cfg, s0, s1, s2, s3, &mut dest).expect("failed to launch cuda kernel");
+        dest_host = dest.to_host_vec(&stream).expect("failed to copy device buffer to host");
         results[i] = dest_host[0];
         s0 = dest_host[1];
         s1 = dest_host[2];
@@ -1892,23 +1813,23 @@ fn test_gpu_xoshiro() {
     match first_mismatch {
         None => {
             println!(
-                "OK: GPU kernel matches C reference bit-for-bit for all {} values",
+                "OK: gpu xoshiro matches C reference for all {} values",
                 n
             );
 
             let dir_path = format!("results/xoshiro128p_test");
-            fs::create_dir_all(&dir_path).expect("Unable to create directory");
+            fs::create_dir_all(&dir_path).expect("unable to create directory");
             let filename = format!("{}/gpu_to_c_res.csv", dir_path);
 
-            let mut file = File::create(&filename).expect("Unable to create file");
-            writeln!(file, "gpu,c").expect("Unable to write header");
+            let mut file = File::create(&filename).expect("unable to create file");
+            writeln!(file, "gpu,c").expect("unable to write header");
 
             for (step, (&gpu_val, &c_val)) in results.iter().zip(c_res.iter()).enumerate() {
-                writeln!(file, "{},{}", gpu_val, c_val).expect("Unable to write row");
+                writeln!(file, "{},{}", gpu_val, c_val).expect("unable to write row");
             }
         }
         Some(i) => {
-            println!("xoshiro128+ GPU kernel diverged from reference at index {}", i);
+            println!("gpu xoshiro diverged from reference at index {}", i);
         }
     }
 }
