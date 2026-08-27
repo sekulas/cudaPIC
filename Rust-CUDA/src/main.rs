@@ -1,5 +1,5 @@
 //-------------------------------------------------------------------//
-//       eduPIC-GPU : GPU-parallel 1d3v PIC/MCC simulation           //
+//       cudaPIC : GPU-parallel 1d3v PIC/MCC simulation           //
 //       Based on eduPIC by Z. Donko et al. (2021)                   //
 //       Parallelized with cuda-oxide for NVIDIA GPUs                //
 //-------------------------------------------------------------------//
@@ -7,7 +7,7 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use cuda_core::{memory, CudaContext, DeviceBuffer, PinnedHostBuffer, LaunchConfig};
+use cuda_core::{CudaContext, DeviceBuffer, PinnedHostBuffer, LaunchConfig};
 use cuda_device::{cuda_module, kernel, thread, ptx_asm, DisjointSlice, SharedArray, warp, gpu_assert};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicF32, DeviceAtomicF32, DeviceAtomicU32};
 use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
@@ -18,7 +18,7 @@ use std::time::Instant;
 use std::io::BufWriter;
 use std::fs::{self, File};
 use std::io::Write;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime};
 use chrono_tz::Europe::Warsaw;
 use chrono_tz::Tz;
 
@@ -28,7 +28,6 @@ type Real = f32;
 const PI: f64              = 3.141592653589793;      // mathematical constant Pi
 const TWO_PI: f64          = 2.0 * PI;               // two times Pi
 const E_CHARGE: f64        = 1.60217662e-19;         // electron charge [C]
-const EV_TO_J: f64         = E_CHARGE;               // eV <-> Joule conversion factor
 const E_MASS: f64          = 9.10938356e-31;         // mass of electron [kg]
 const AR_MASS: f64         = 6.63352090e-26;         // mass of argon atom [kg]
 const MU_ARAR: f64         = AR_MASS / 2.0;          // reduced mass of two argon atoms [kg]
@@ -54,8 +53,7 @@ const N_SUB: u32           = 20;                                       // ions m
 const DT_I: f64            = (N_SUB as f64) * DT_E;                    // ion time step [s]
 const DX: f64              = L / ((N_G - 1) as f64);                   // spatial grid division [m]
 const INV_DX: f64          = 1.0 / DX;                                 // inverse of spatial grid size [1/m]
-const GAS_DENSITY: f64     = PRESSURE / (K_BOLTZMANN * TEMPERATURE);   // background gas gas density [m-3]
-const OMEGA: f64           = TWO_PI * FREQUENCY;                       // angular frequency [rad/s]
+const GAS_DENSITY: f64     = PRESSURE / (K_BOLTZMANN * TEMPERATURE);   // background gas density [m-3]
 
 // electron and ion cross sections
 const N_CS: usize          = 5;                      // total number of processes / cross sections
@@ -74,10 +72,6 @@ const MIN_X: f64           = 0.45 * L;               // lower limit of central r
 const MAX_X: f64           = 0.55 * L;               // upper limit of central region
 const N_EEPF: usize        = 2000;                   // number of energy bins in Electron Energy Probability Function (EEPF)
 const DE_EEPF: f64         = 0.05;                   // resolution of EEPF [eV]
-const N_FED: usize         = 200;                    // number of energy bins in Flux-Energy Distributions (EFED and IFED)
-const DE_FED: f64          = 1.0;                    // resolution of FEDs (EFED and IFED) [eV]
-const N_BIN: u32           = 20;                     // number of time steps binned for the XT distributions
-const N_XT: usize          = (N_T / N_BIN) as usize; // number of spatial bins for the XT distributions
 
 // gpu capacity and allocation constants
 const MAX_PARTICLES: usize = 120_000;                       // maximum number of particles per species (pre-allocated on GPU).
@@ -86,7 +80,7 @@ const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;            // leapfrog accelera
 const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);  // weight factor for density deposition
 
 // kernel launch parameters
-const MAX_PARTICLES_U32: u32 = MAX_PARTICLES as u32;                            // particle base for kernel launch param
+const MAX_PARTICLES_U32: u32 = MAX_PARTICLES as u32;                            // particle amount for kernel launch param
 const POISSON_SCAN_BLOCK_SIZE: u32   = 416;                                     // size of block for poisson kernel 
 const POISSON_SCAN_NUM_WARPS:  usize = POISSON_SCAN_BLOCK_SIZE as usize / 32;   // amount of warps in block for poisson kernel
 const COMPACT_BLOCK_SIZE: u32   = 512;                                          // size of block for stream compaction kernel
@@ -107,7 +101,7 @@ const ALPHA_F: f32 = (-DX * DX / EPSILON0) as f32;               // precomputed 
 const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32;  // precomputed factor
 const HALF_INV_DX_F: Real = (0.5 * INV_DX) as Real;              // precomputed factor             
         
-// measurments
+// measurment
 const MIN_X_F: Real = MIN_X as Real;        // f32 lower limit of central region
 const MAX_X_F: Real = MAX_X as Real;        // f32 upper limit of central region
 const DE_EEPF_F: Real = DE_EEPF as Real;    // f32 resolution of EEPF
@@ -182,7 +176,7 @@ struct GpuSimState {
     // tmp var to store data about particle counts
     alive_counter: DeviceBuffer<u32>,
 
-    // measurments
+    // measurment
     cumul_e_density: DeviceBuffer<f64>, 
     cumul_i_density: DeviceBuffer<f64>,
     eepf_counts:     DeviceBuffer<u32>,
@@ -579,8 +573,6 @@ mod kernels {
         static mut WARP_SUMS: SharedArray<u32, COMPACT_NUM_WARPS> = SharedArray::UNINIT;
         static mut BASE_S:    SharedArray<u32, 1>                 = SharedArray::UNINIT;
 
-        let tid   = thread::threadIdx_x() as usize;
-        let bdim  = thread::blockDim_x()  as usize;
         let i     = thread::index_1d().get();
         let lane  = warp::lane_id();
         let wid   = warp::warp_id() as usize;
@@ -1280,7 +1272,7 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
     };
 
     let qmoi = |e_lab: f64| -> f64 {
-        1.15e-18 * e_lab.powf(-0.1) * (1.0 + 0.015 / e_lab).powf(0.6) //2*e!
+        1.15e-18 * e_lab.powf(-0.1) * (1.0 + 0.015 / e_lab).powf(0.6)
     };
     let qiso = |e_lab: f64| -> f64 {
         2.0e-19 * e_lab.powf(-0.5) / (1.0 + e_lab) + 3.0e-19 * e_lab / (1.0 + e_lab / 3.0).powf(2.0)
@@ -1446,11 +1438,11 @@ fn save_eepf(eepf_raw: &[u32], tsmp: DateTime<Tz>) {
 fn main() {
     // perform_tests();
 
-    println!(">> eduPIC-GPU: starting...");
-    println!(">> eduPIC-GPU: cuda-oxide parallel PIC/MCC simulation");
+    println!(">> cudaPIC: starting...");
+    println!(">> cudaPIC: cuda-oxide parallel PIC/MCC simulation");
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: edupic-gpu <num_cycles> [--measure] [last X measurement_cycles]");
+        eprintln!("usage: cudapic <num_cycles> [--measure <measurement_cycles>]");
         std::process::exit(1);
     }
     let num_cycles: usize = args[1].parse().expect("invalid cycle count");
@@ -1459,19 +1451,25 @@ fn main() {
         .map(|s| s.parse().expect("invalid measurement_cycles"))
         .unwrap_or(1);
     let measurement_start_cycle = num_cycles.saturating_sub(measurement_cycles);
-    println!(">> eduPIC-GPU: num_cycles = {}, measure = {}, measurement_start_cycle = {}",
+
+    if measure {
+        println!(">> cudaPIC: num_cycles = {}, measure = {}, measurement_start_cycle = {}",
         num_cycles, measure, measurement_start_cycle);
+    }
+    else {
+        println!(">> cudaPIC: num_cycles = {}, measure = {}", num_cycles, measure);
+    }
 
     let start_init = Instant::now();
 
     // cuda context init
     let ctx = CudaContext::new(0).expect("failed to create CUDA context (no GPU?)");
     let stream = ctx.default_stream();
-    println!(">> eduPIC-GPU: CUDA context initialized");
+    println!(">> cudaPIC: CUDA context initialized");
 
     // cpu cs precomputation
     let (cs_flat, sigma_tot_e, sigma_tot_i) = init_cross_sections();
-    println!(">> eduPIC-GPU: cross-sections computed ({} entries per process)", CS_RANGES);
+    println!(">> cudaPIC: cross-sections computed ({} entries per process)", CS_RANGES);
 
     // cpu particle init
     let electrons_host = init_particles(N_INIT);
@@ -1494,7 +1492,7 @@ fn main() {
     gpu.upload_rng_state(&stream, &e_seeds, &i_seeds)
         .expect("failed to upload RNG state");
 
-    println!(">> eduPIC-GPU: data uploaded to GPU");
+    println!(">> cudaPIC: data uploaded to GPU");
 
     // launch configs definition
     let cfg = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
@@ -1516,7 +1514,7 @@ fn main() {
     let mut h_counter_i = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
 
     // simulation loop
-    println!(">> eduPIC-GPU: running {} cycles x{} steps...", num_cycles, N_T);
+    println!(">> cudaPIC: running {} cycles x{} steps...", num_cycles, N_T);
     let module = kernels::load(&ctx).expect("Failed to load CUDA module");
 
     let mut n_e: u32 = N_INIT as u32;
@@ -1649,8 +1647,8 @@ fn main() {
         .expect("failed to download ions");
 
     let elapsed = start.elapsed().as_secs_f64();
-    println!(">> eduPIC-GPU: simulation complete in {:.3} s", elapsed);
-    println!(">> eduPIC-GPU: final particles: {} electrons, {} ions", n_e_final, n_i_final);
+    println!(">> cudaPIC: simulation complete in {:.3} s", elapsed);
+    println!(">> cudaPIC: final particles: {} electrons, {} ions", n_e_final, n_i_final);
 
     let tsmp = chrono::Utc::now().with_timezone(&Warsaw);
     save_particle_data(&_electrons_result, n_e_final as usize, num_cycles, ParticleSpecies::Electrons, tsmp);
@@ -1667,7 +1665,7 @@ fn main() {
         save_density_avg(&cumul_e, &cumul_i, n_steps_e, n_steps_i, tsmp);
         save_eepf(&eepf_raw, tsmp);
 
-        println!(">> eduPIC-GPU: measurement data saved (density_avg, eepf, info) for {} cycles", measurement_cycles);
+        println!(">> cudaPIC: measurement data saved (density_avg, eepf, info) for {} cycles", measurement_cycles);
     }
 }
 
@@ -1773,7 +1771,6 @@ fn test_gpu_xoshiro() {
     println!("\n>> TEST: xoshiro to ref");
     let c_res = load_c_xoshiro_result(Path::new("xorshiro128c/10000-c.txt"));
     let n = c_res.len();
-    println!("  loaded {} reference values from 10000-c.txt", n);
 
     let (mut s0, mut s1, mut s2, mut s3) = (1, 1, 1, 1);
 
@@ -1781,7 +1778,6 @@ fn test_gpu_xoshiro() {
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx).expect("failed to load cuda module");
     let mut dest = DeviceBuffer::<u32>::zeroed(&stream, 5).expect("failed to create device buffer");
-    let mut dest_host = vec![0u32; 5];
 
     // one block of one thread
     let cfg = LaunchConfig {
@@ -1794,7 +1790,7 @@ fn test_gpu_xoshiro() {
 
     for i in 0..n {
         module.xoshiro128p_test_wrapper(&stream, cfg, s0, s1, s2, s3, &mut dest).expect("failed to launch cuda kernel");
-        dest_host = dest.to_host_vec(&stream).expect("failed to copy device buffer to host");
+        let dest_host = dest.to_host_vec(&stream).expect("failed to copy device buffer to host");
         results[i] = dest_host[0];
         s0 = dest_host[1];
         s1 = dest_host[2];
@@ -1813,7 +1809,7 @@ fn test_gpu_xoshiro() {
     match first_mismatch {
         None => {
             println!(
-                "OK: gpu xoshiro matches C reference for all {} values",
+                "   gpu xoshiro matches C reference for all {} values",
                 n
             );
 
