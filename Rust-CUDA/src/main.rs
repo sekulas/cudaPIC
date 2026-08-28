@@ -1463,9 +1463,9 @@ fn main() {
     let start_init = Instant::now();
 
     // cuda context init
-    let ctx = CudaContext::new(0).expect("failed to create CUDA context (no GPU?)");
+    let ctx = CudaContext::new(0).expect("failed to create cuda context");
     let stream = ctx.default_stream();
-    println!(">> cudaPIC: CUDA context initialized");
+    println!(">> cudaPIC: cuda context initialized");
 
     // cpu cs precomputation
     let (cs_flat, sigma_tot_e, sigma_tot_i) = init_cross_sections();
@@ -1515,7 +1515,7 @@ fn main() {
 
     // simulation loop
     println!(">> cudaPIC: running {} cycles x{} steps...", num_cycles, N_T);
-    let module = kernels::load(&ctx).expect("Failed to load CUDA module");
+    let module = kernels::load(&ctx).expect("failed to load cuda module");
 
     let mut n_e: u32 = N_INIT as u32;
     let mut n_i: u32 = N_INIT as u32;
@@ -1541,13 +1541,13 @@ fn main() {
         let in_measurement_window = measure && cycle >= measurement_start_cycle;
 
         for t in 0..N_T {
-            gpu.e_density.zero_async(&stream).expect("Failed to zero e_density");
+            gpu.e_density.zero_async(&stream).expect("failed to zero e_density");
             module.get_density(&stream, mac_and_density_cfg,
                 &gpu.e_x, &gpu.e_density, &gpu.n_electrons,
             ).expect("get_density (electrons) failed");
 
             if t % N_SUB == 0 {
-                gpu.i_density.zero_async(&stream).expect("Failed to zero i_density");
+                gpu.i_density.zero_async(&stream).expect("failed to zero i_density");
                 module.get_density(&stream, mac_and_density_cfg,
                     &gpu.i_x, &gpu.i_density, &gpu.n_ions,
                 ).expect("get_density (ions) failed");
@@ -1639,7 +1639,7 @@ fn main() {
     }
 
     // synchronization and result gathering
-    ctx.synchronize().expect("CUDA synchronization failed");
+    ctx.synchronize().expect("cuda synchronization failed");
 
     let (_electrons_result, n_e_final) = gpu.download_electrons(&stream)
         .expect("failed to download electrons");
