@@ -970,7 +970,7 @@ mod kernels {
         }
 
         if gy == 0.0 as Real {
-            if gz >= 0.0 as Real { phi = 0.5 * PI as Real; }
+            if gz > 0.0 as Real { phi = 0.5 * PI as Real; }
             else { phi = -0.5 * PI as Real; }
         } else {
             phi = ptx_atan2(gz, gy);
