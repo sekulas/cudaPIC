@@ -74,7 +74,7 @@ const N_EEPF: usize        = 2000;                   // number of energy bins in
 const DE_EEPF: f64         = 0.05;                   // resolution of EEPF [eV]
 
 // gpu capacity and allocation constants
-const MAX_PARTICLES: usize = 120_000;                       // maximum number of particles per species (pre-allocated on GPU).
+const MAX_PARTICLES: usize = 120_000;                       // maximum number of particles per species (pre-allocated on gpu).
 const FACTOR_E: f64 = DT_E / E_MASS * (-E_CHARGE);          // leapfrog acceleration factor for electrons
 const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;            // leapfrog acceleration factor for ions
 const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);  // weight factor for density deposition
@@ -1469,15 +1469,13 @@ fn main() {
 
     // cpu cs precomputation
     let (cs_flat, sigma_tot_e, sigma_tot_i) = init_cross_sections();
-    println!(">> cudaPIC: cross-sections computed ({} entries per process)", CS_RANGES);
-
     // cpu particle init
     let electrons_host = init_particles(N_INIT);
     let ions_host      = init_particles(N_INIT);
 
     // gpu state allocation
     let mut gpu = GpuSimState::allocate(&stream, measure)
-        .expect("failed to allocate GPU memory");
+        .expect("failed to allocate gpu memory");
 
     // gpu data upload
     gpu.upload_electrons(&stream, &electrons_host, N_INIT as u32)
@@ -1490,9 +1488,9 @@ fn main() {
     let e_seeds = xoshiro128_seed_streams([0x1234_5678, 0x1111_2222, 0x2222_3333, 0x3333_4444], MAX_PARTICLES);
     let i_seeds = xoshiro128_seed_streams([0x4444_5555, 0x5555_6666, 0x6666_7777, 0x7777_8888], MAX_PARTICLES);
     gpu.upload_rng_state(&stream, &e_seeds, &i_seeds)
-        .expect("failed to upload RNG state");
+        .expect("failed to upload rng state");
 
-    println!(">> cudaPIC: data uploaded to GPU");
+    println!(">> cudaPIC: data uploaded to gpu");
 
     // launch configs definition
     let cfg = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
@@ -1683,9 +1681,9 @@ fn hakim_exact_fn(x: f64) -> f64 {
 }
 
 fn test_gpu_dps_convergence_hakim() {
-    println!("\n>> TEST: DPS Convergence GPU Hakim (JE11)");
+    println!("\n### test: dps convergence gpu Hakim (JE11)");
     println!("   source: 1 - 2x^2,  psi(0)=0, psi(1)=0");
-    println!("   {:>6}  {:>12}  {:>14}  {:>10}", "N_elem", "dx", "avg_error", "order");
+    println!("   {:>6}  {:>12}  {:>14}  {:>10}", "n_elem", "dx", "avg_error", "order");
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
@@ -1766,7 +1764,7 @@ fn load_c_xoshiro_result(path: &Path) -> Vec<u32> {
 }
 
 fn test_gpu_xoshiro() {
-    println!("\n>> TEST: xoshiro to ref");
+    println!("\n### test: xoshiro to ref");
     let c_res = load_c_xoshiro_result(Path::new("xorshiro128c/10000-c.txt"));
     let n = c_res.len();
 
@@ -1823,7 +1821,7 @@ fn test_gpu_xoshiro() {
             }
         }
         Some(i) => {
-            println!("gpu xoshiro diverged from reference at index {}", i);
+            println!("  gpu xoshiro diverged from reference at index {}", i);
         }
     }
 }
