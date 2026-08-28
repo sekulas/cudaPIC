@@ -1305,7 +1305,7 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
 }
 
 fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
-    debug_assert!(master_seed != [0, 0, 0, 0], "state should not be everywhere 0");
+    assert!(master_seed != [0, 0, 0, 0], "state should not be everywhere 0");
 
     const JUMP: [u32; 4] = [0x8764000b, 0xf542d2d3, 0x6fa035c3, 0x77f2db5b];
 
@@ -1353,22 +1353,21 @@ fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
 
 // host side data saving helpers 
 enum ParticleSpecies {
-    Electrons = 0,
-    Ions      = 1,
+    Electrons,
+    Ions
 }
 
 impl fmt::Display for ParticleSpecies {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ParticleSpecies::Electrons => write!(f, "electrons"),
-            ParticleSpecies::Ions      => write!(f, "ions"),
+            ParticleSpecies::Ions => write!(f, "ions"),
         }
     }
 }
 
 fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, species: ParticleSpecies, tsmp: DateTime<Tz>) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
-
     let dir_path = format!("results/{}", time_stamp);
     fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/{:04}_{}_{}.csv", dir_path, step, time_stamp, species);
@@ -1390,16 +1389,21 @@ fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, spec
 
 fn save_particle_growth_data(n_e: Vec<u32>, n_i: Vec<u32>, tsmp: DateTime<Tz>) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
-
     let dir_path = format!("results/{}", time_stamp);
     fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/particle_growth_{}.csv", dir_path, time_stamp);
 
     let mut file = File::create(&filename).expect("unable to create file");
-    writeln!(file, "step,n_e,n_i").expect("unable to write header");
+    let mut writer = BufWriter::new(file);
+
+    writeln!(writer, "step,n_e,n_i").expect("unable to write header");
 
     for (step, (&n_e_val, &n_i_val)) in n_e.iter().zip(n_i.iter()).enumerate() {
-        writeln!(file, "{},{},{}", step*CHECKPOINT_CYCLES, n_e_val, n_i_val).expect("unable to write particle growth data");
+        writeln!(
+            writer, 
+            "{},{},{}", 
+            step * CHECKPOINT_CYCLES, n_e_val, n_i_val
+        ).expect("unable to write particle growth data");
     }
 }
 
@@ -1410,11 +1414,16 @@ fn save_density_avg(cumul_e: &[f64], cumul_i: &[f64], n_steps_e: f64, n_steps_i:
     let filename = format!("{}/density_avg_{}.csv", dir_path, time_stamp);
 
     let mut file = File::create(&filename).expect("unable to create file");
-    writeln!(file, "x,n_e,n_i").expect("header");
+    let mut writer = BufWriter::new(file);
+
+    writeln!(writer, "x,n_e,n_i").expect("unable to write header");
     for k in 0..N_G {
         let x = k as f64 * DX as f64;
-        writeln!(file, "{},{},{}", x, cumul_e[k] / n_steps_e as f64, cumul_i[k] / n_steps_i as f64)
-            .expect("row");
+        writeln!(
+            writer, 
+            "{},{},{}", 
+            x, cumul_e[k] / n_steps_e as f64, cumul_i[k] / n_steps_i as f64
+        ).expect("unable to write density average data");
     }
 }
 
@@ -1424,14 +1433,20 @@ fn save_eepf(eepf_raw: &[u32], tsmp: DateTime<Tz>) {
     fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/eepf_{}.csv", dir_path, time_stamp);
 
+    let mut file = File::create(&filename).expect("unable to create file");
+    let mut writer = BufWriter::new(file);
+
     let h: f64 = eepf_raw.iter().map(|&c| c as f64).sum::<f64>() * DE_EEPF;
 
-    let mut file = File::create(&filename).expect("unable to create file");
-    writeln!(file, "energy_eV,eepf").expect("header");
+    writeln!(writer, "energy_eV,eepf").expect("unable to write header");
     for (i, &count) in eepf_raw.iter().enumerate() {
         let e = (0.5 + i as f64) * DE_EEPF;
         let val = count as f64 / h / e.sqrt();
-        writeln!(file, "{},{}", e, val).expect("row");
+        writeln!(
+            writer, 
+            "{},{}", 
+            e, val
+        ).expect("unable to write eepf data");
     }
 }
 
@@ -1469,6 +1484,7 @@ fn main() {
 
     // cpu cs precomputation
     let (cs_flat, sigma_tot_e, sigma_tot_i) = init_cross_sections();
+    
     // cpu particle init
     let electrons_host = init_particles(N_INIT);
     let ions_host      = init_particles(N_INIT);
@@ -1524,9 +1540,9 @@ fn main() {
     let cfg_i = cfg;
 
     if measure {
-        gpu.cumul_e_density.zero_async(&stream).expect("zero cumul_e_density");
-        gpu.cumul_i_density.zero_async(&stream).expect("zero cumul_i_density");
-        gpu.eepf_counts.zero_async(&stream).expect("zero eepf_counts");
+        gpu.cumul_e_density.zero_async(&stream).expect("failed to zero cumul_e_density");
+        gpu.cumul_i_density.zero_async(&stream).expect("failed to zero cumul_i_density");
+        gpu.eepf_counts.zero_async(&stream).expect("failed to zero eepf_counts");
     }
 
     println!("initialization time: {:.3} s", start_init.elapsed().as_secs_f64());
