@@ -1809,17 +1809,11 @@ fn main() {
 
         if (cycle + 1) % CHECKPOINT_CYCLES == 0 {
             unsafe {
-                gpu.n_electrons
-                    .copy_to_pinned_host_async(&stream, &mut h_counter_e)
+                gpu.n_electrons.copy_to_pinned_host_async(&stream, &mut h_counter_e);
+                gpu.n_ions.copy_to_pinned_host_async(&stream, &mut h_counter_i);
             }
-            .expect("copy_to_pinned_host_async n_electrons checkpoint failed");
-            unsafe {
-                gpu.n_ions
-                    .copy_to_pinned_host_async(&stream, &mut h_counter_i)
-            }
-            .expect("copy_to_pinned_host_async n_ions checkpoint failed");
 
-            stream.synchronize().unwrap();
+            stream.synchronize().expect("cuda synchronization failed");
 
             println!(
                 "   checkpoint at cycle {}: n_e={}, n_i={}, time={:.3}s",
