@@ -1484,10 +1484,10 @@ fn main() {
 
     // cpu cs precomputation
     let (cs_flat, sigma_tot_e, sigma_tot_i) = init_cross_sections();
-    
+
     // cpu particle init
     let electrons_host = init_particles(N_INIT);
-    let ions_host      = init_particles(N_INIT);
+    let ions_host = init_particles(N_INIT);
 
     // gpu state allocation
     let mut gpu = GpuSimState::allocate(&stream, measure)
@@ -1521,7 +1521,9 @@ fn main() {
         shared_mem_bytes: 0,
     };
     let acc_density_cfg = poisson_cfg;
-    let eepf_cfg    = cfg;         
+    let eepf_cfg = cfg;
+    let col_e_cfg = cfg;
+    let col_i_cfg = cfg;
 
     // pinned mem for particle count retrieval
     let mut h_counter_e = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
@@ -1535,9 +1537,6 @@ fn main() {
     let mut n_i_history: Vec<u32> = Vec::with_capacity(num_cycles / CHECKPOINT_CYCLES + 1);
     n_e_history.push(N_INIT as u32);
     n_i_history.push(N_INIT as u32);
-
-    let cfg_e = cfg;
-    let cfg_i = cfg;
 
     if measure {
         gpu.cumul_e_density.zero_async(&stream).expect("failed to zero cumul_e_density");
@@ -1609,7 +1608,7 @@ fn main() {
                 gpu.alive_counter.copy_from_device_async(&gpu.n_electrons, &stream).expect("failed to copy n_electrons to alive_counter");
             }
 
-            module.check_collisions_e(&stream, cfg_e,
+            module.check_collisions_e(&stream, col_e_cfg,
                 &gpu.sigma_tot_e, &gpu.cs, &gpu.n_electrons,
                 &mut gpu.e_x, &mut gpu.e_vx, &mut gpu.e_vy, &mut gpu.e_vz,
                 &mut gpu.rng_e0, &mut gpu.rng_e1, &mut gpu.rng_e2, &mut gpu.rng_e3,
@@ -1619,7 +1618,7 @@ fn main() {
             gpu.n_electrons.copy_from_device_async(&gpu.alive_counter, &stream).expect("failed to copy alive_counter to n_electrons");
 
             if t % N_SUB == 0 {
-                module.check_collisions_i(&stream, cfg_i,
+                module.check_collisions_i(&stream, col_i_cfg,
                     &gpu.sigma_tot_i, &gpu.cs, &gpu.n_ions,
                     &mut gpu.i_vx, &mut gpu.i_vy, &mut gpu.i_vz,
                     &mut gpu.rng_i0, &mut gpu.rng_i1, &mut gpu.rng_i2, &mut gpu.rng_i3,
