@@ -1517,12 +1517,10 @@ fn main() {
     println!(">> cudaPIC: running {} cycles x{} steps...", num_cycles, N_T);
     let module = kernels::load(&ctx).expect("failed to load cuda module");
 
-    let mut n_e: u32 = N_INIT as u32;
-    let mut n_i: u32 = N_INIT as u32;
     let mut n_e_history: Vec<u32> = Vec::with_capacity(num_cycles / CHECKPOINT_CYCLES + 1);
     let mut n_i_history: Vec<u32> = Vec::with_capacity(num_cycles / CHECKPOINT_CYCLES + 1);
-    n_e_history.push(n_e);
-    n_i_history.push(n_i);
+    n_e_history.push(N_INIT as u32);
+    n_i_history.push(N_INIT as u32);
 
     let cfg_e = cfg;
     let cfg_i = cfg;
