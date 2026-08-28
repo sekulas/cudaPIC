@@ -969,11 +969,24 @@ mod kernels {
     }
 
     #[kernel]
-    pub fn check_collisions_e(total_cs_e: &[Real], cs: &[Real], active_e: &[u32], 
-                        mut x: DisjointSlice<Real>, mut vx: DisjointSlice<Real>, mut vy: DisjointSlice<Real>, mut vz: DisjointSlice<Real>, 
-                        mut rng0: DisjointSlice<u32>, mut rng1: DisjointSlice<u32>, mut rng2: DisjointSlice<u32>, mut rng3: DisjointSlice<u32>,
-                        mut i_x: DisjointSlice<Real>, mut i_vx: DisjointSlice<Real>, mut i_vy: DisjointSlice<Real>, mut i_vz: DisjointSlice<Real>,
-                        alive_e: &[u32], alive_i: &[u32]
+    pub fn check_collisions_e(
+        total_cs_e: &[Real],
+        cs: &[Real],
+        active_e: &[u32],
+        mut x: DisjointSlice<Real>,
+        mut vx: DisjointSlice<Real>,
+        mut vy: DisjointSlice<Real>,
+        mut vz: DisjointSlice<Real>,
+        mut rng0: DisjointSlice<u32>,
+        mut rng1: DisjointSlice<u32>,
+        mut rng2: DisjointSlice<u32>,
+        mut rng3: DisjointSlice<u32>,
+        mut i_x: DisjointSlice<Real>,
+        mut i_vx: DisjointSlice<Real>,
+        mut i_vy: DisjointSlice<Real>,
+        mut i_vz: DisjointSlice<Real>,
+        alive_e: &[u32],
+        alive_i: &[u32],
     ) {
         let i = thread::index_1d().get();
         if i >= active_e[0] as usize {
@@ -997,15 +1010,46 @@ mod kernels {
 
         let p_coll: Real = 1.0 - ptx_exp(-nu * DT_E as Real);
         if rand_val < p_coll {
-            collision_e(cs, &mut x, &mut vx, &mut vy, &mut vz, i, energy_index, &mut rng0, &mut rng1, &mut rng2, &mut rng3,
-                       &mut i_x, &mut i_vx, &mut i_vy, &mut i_vz, alive_e, alive_i);
+            collision_e(
+                cs,
+                &mut x,
+                &mut vx,
+                &mut vy,
+                &mut vz,
+                i,
+                energy_index,
+                &mut rng0,
+                &mut rng1,
+                &mut rng2,
+                &mut rng3,
+                &mut i_x,
+                &mut i_vx,
+                &mut i_vy,
+                &mut i_vz,
+                alive_e,
+                alive_i,
+            );
         }
-        
     }
 
-    pub fn collision_e(cs: &[Real], x: &mut DisjointSlice<Real>, vx: &mut DisjointSlice<Real>, vy: &mut DisjointSlice<Real>, vz: &mut DisjointSlice<Real>, i: usize, 
-                    energy_index: usize, rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>,
-                    i_x: &mut DisjointSlice<Real>, i_vx: &mut DisjointSlice<Real>, i_vy: &mut DisjointSlice<Real>, i_vz: &mut DisjointSlice<Real>, alive_e: &[u32], alive_i: &[u32]
+    pub fn collision_e(
+        cs: &[Real],
+        x: &mut DisjointSlice<Real>,
+        vx: &mut DisjointSlice<Real>,
+        vy: &mut DisjointSlice<Real>,
+        vz: &mut DisjointSlice<Real>,
+        i: usize,
+        energy_index: usize,
+        rng0: &mut DisjointSlice<u32>,
+        rng1: &mut DisjointSlice<u32>,
+        rng2: &mut DisjointSlice<u32>,
+        rng3: &mut DisjointSlice<u32>,
+        i_x: &mut DisjointSlice<Real>,
+        i_vx: &mut DisjointSlice<Real>,
+        i_vy: &mut DisjointSlice<Real>,
+        i_vz: &mut DisjointSlice<Real>,
+        alive_e: &[u32],
+        alive_i: &[u32],
     ) {
         let mut gx: Real = unsafe { *vx.get_unchecked_mut(i) };
         let mut gy: Real = unsafe { *vy.get_unchecked_mut(i) };
@@ -1156,9 +1200,21 @@ mod kernels {
         let rand_val = rng_next_f32(i, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
         let p_coll: Real = 1.0 - ptx_exp(-nu * DT_I as Real);
         if rand_val < p_coll {
-            collision_i(cs, &mut vx, &mut vy, &mut vz, i,
-                        vxa, vya, vza, energy_index,
-                        &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+            collision_i(
+                cs,
+                &mut vx,
+                &mut vy,
+                &mut vz,
+                i,
+                vxa,
+                vya,
+                vza,
+                energy_index,
+                &mut rng0,
+                &mut rng1,
+                &mut rng2,
+                &mut rng3,
+            );
         }
     }
 
@@ -1752,15 +1808,25 @@ fn main() {
         }
 
         if (cycle + 1) % CHECKPOINT_CYCLES == 0 {
-            unsafe { gpu.n_electrons.copy_to_pinned_host_async(&stream, &mut h_counter_e) }
-                .expect("copy_to_pinned_host_async n_electrons checkpoint failed");
-            unsafe { gpu.n_ions.copy_to_pinned_host_async(&stream, &mut h_counter_i) }
-                .expect("copy_to_pinned_host_async n_ions checkpoint failed");
-            
+            unsafe {
+                gpu.n_electrons
+                    .copy_to_pinned_host_async(&stream, &mut h_counter_e)
+            }
+            .expect("copy_to_pinned_host_async n_electrons checkpoint failed");
+            unsafe {
+                gpu.n_ions
+                    .copy_to_pinned_host_async(&stream, &mut h_counter_i)
+            }
+            .expect("copy_to_pinned_host_async n_ions checkpoint failed");
+
             stream.synchronize().unwrap();
 
-            println!("   checkpoint at cycle {}: n_e={}, n_i={}, time={:.3}s", 
-                cycle + 1, h_counter_e[0], h_counter_i[0], start.elapsed().as_secs_f64()
+            println!(
+                "   checkpoint at cycle {}: n_e={}, n_i={}, time={:.3}s",
+                cycle + 1,
+                h_counter_e[0],
+                h_counter_i[0],
+                start.elapsed().as_secs_f64()
             );
             n_e_history.push(h_counter_e[0]);
             n_i_history.push(h_counter_i[0]);
@@ -1770,10 +1836,10 @@ fn main() {
     // synchronization and result gathering
     ctx.synchronize().expect("cuda synchronization failed");
 
-    let (_electrons_result, n_e_final) = gpu.download_electrons(&stream)
+    let (_electrons_result, n_e_final) = gpu
+        .download_electrons(&stream)
         .expect("failed to download electrons");
-    let (_ions_result, n_i_final) = gpu.download_ions(&stream)
-        .expect("failed to download ions");
+    let (_ions_result, n_i_final) = gpu.download_ions(&stream).expect("failed to download ions");
 
     let elapsed = start.elapsed().as_secs_f64();
     println!(">> cudaPIC: simulation complete in {:.3} s", elapsed);
@@ -1783,12 +1849,25 @@ fn main() {
     );
 
     let tsmp = chrono::Utc::now().with_timezone(&Warsaw);
-    save_particle_data(&_electrons_result, n_e_final as usize, num_cycles, ParticleSpecies::Electrons, tsmp);
-    save_particle_data(&_ions_result, n_i_final as usize, num_cycles, ParticleSpecies::Ions, tsmp);
+    save_particle_data(
+        &_electrons_result,
+        n_e_final as usize,
+        num_cycles,
+        ParticleSpecies::Electrons,
+        tsmp,
+    );
+    save_particle_data(
+        &_ions_result,
+        n_i_final as usize,
+        num_cycles,
+        ParticleSpecies::Ions,
+        tsmp,
+    );
     save_particle_growth_data(n_e_history, n_i_history, tsmp);
 
     if measure {
-        let (cumul_e, cumul_i, eepf_raw) = gpu.download_measurements(&stream)
+        let (cumul_e, cumul_i, eepf_raw) = gpu
+            .download_measurements(&stream)
             .expect("failed to download measurements");
 
         let n_steps_e = (measurement_cycles as f64 * N_T as f64) as f64;
