@@ -7,109 +7,111 @@
 #![allow(non_snake_case)]
 #![allow(dead_code)]
 
-use cuda_core::{CudaContext, DeviceBuffer, PinnedHostBuffer, LaunchConfig};
-use cuda_device::{cuda_module, kernel, thread, ptx_asm, DisjointSlice, SharedArray, warp, gpu_assert};
-use cuda_device::atomic::{AtomicOrdering, BlockAtomicF32, DeviceAtomicF32, DeviceAtomicU32};
-use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
-use rand::RngExt;
-use rand_distr::Normal;
-use std::{env, fmt};
-use std::time::Instant;
-use std::io::BufWriter;
-use std::fs::{self, File};
-use std::io::Write;
-use chrono::{DateTime};
+use chrono::DateTime;
 use chrono_tz::Europe::Warsaw;
 use chrono_tz::Tz;
+use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig, PinnedHostBuffer};
+use cuda_device::atomic::{AtomicOrdering, BlockAtomicF32, DeviceAtomicF32, DeviceAtomicU32};
+use cuda_device::cooperative_groups::{block_scan, ops::Sum, this_thread_block};
+use cuda_device::{
+    cuda_module, gpu_assert, kernel, ptx_asm, thread, warp, DisjointSlice, SharedArray,
+};
+use rand::RngExt;
+use rand_distr::Normal;
+use std::fs::{self, File};
+use std::io::BufWriter;
+use std::io::Write;
+use std::time::Instant;
+use std::{env, fmt};
 
 type Real = f32;
 
 // constants
-const PI: f64              = 3.141592653589793;      // mathematical constant Pi
-const TWO_PI: f64          = 2.0 * PI;               // two times Pi
-const E_CHARGE: f64        = 1.60217662e-19;         // electron charge [C]
-const E_MASS: f64          = 9.10938356e-31;         // mass of electron [kg]
-const AR_MASS: f64         = 6.63352090e-26;         // mass of argon atom [kg]
-const MU_ARAR: f64         = AR_MASS / 2.0;          // reduced mass of two argon atoms [kg]
-const K_BOLTZMANN: f64     = 1.38064852e-23;         // boltzmann's constant [J/K]
-const EPSILON0: f64        = 8.85418781e-12;         // permittivity of free space [F/m]
+const PI: f64 = 3.141592653589793; // mathematical constant Pi
+const TWO_PI: f64 = 2.0 * PI; // two times Pi
+const E_CHARGE: f64 = 1.60217662e-19; // electron charge [C]
+const E_MASS: f64 = 9.10938356e-31; // mass of electron [kg]
+const AR_MASS: f64 = 6.63352090e-26; // mass of argon atom [kg]
+const MU_ARAR: f64 = AR_MASS / 2.0; // reduced mass of two argon atoms [kg]
+const K_BOLTZMANN: f64 = 1.38064852e-23; // boltzmann's constant [J/K]
+const EPSILON0: f64 = 8.85418781e-12; // permittivity of free space [F/m]
 
-// simulation parameters        
-const N_G: usize           = 400;                    // number of grid points
-const N_T: u32             = 4000;                   // time steps within an RF period
-const FREQUENCY: f64       = 13.56e6;                // driving frequency [Hz]
-const VOLTAGE: f64         = 250.0;                  // voltage amplitude [V]
-const L: f64               = 0.025;                  // electrode L [m]
-const PRESSURE: f64        = 10.0;                   // gas pressure [Pa]
-const TEMPERATURE: f64     = 350.0;                  // background gas temperature [K]
-const WEIGHT: f64          = 7.0e4;                  // weight of superparticles
-const ELECTRODE_AREA: f64  = 1.0e-4;                 // (fictive) electrode area [m^2]
-const N_INIT: usize        = 1000;                   // number of initial electrons and ions
+// simulation parameters
+const N_G: usize = 400; // number of grid points
+const N_T: u32 = 4000; // time steps within an RF period
+const FREQUENCY: f64 = 13.56e6; // driving frequency [Hz]
+const VOLTAGE: f64 = 250.0; // voltage amplitude [V]
+const L: f64 = 0.025; // electrode L [m]
+const PRESSURE: f64 = 10.0; // gas pressure [Pa]
+const TEMPERATURE: f64 = 350.0; // background gas temperature [K]
+const WEIGHT: f64 = 7.0e4; // weight of superparticles
+const ELECTRODE_AREA: f64 = 1.0e-4; // (fictive) electrode area [m^2]
+const N_INIT: usize = 1000; // number of initial electrons and ions
 
 // additional (derived) constants
-const PERIOD: f64          = 1.0 / FREQUENCY;                          // RF period length [s]
-const DT_E: f64            = PERIOD / (N_T as f64);                    // electron time step [s]
-const N_SUB: u32           = 20;                                       // ions move only in these cycles (subcycling)
-const DT_I: f64            = (N_SUB as f64) * DT_E;                    // ion time step [s]
-const DX: f64              = L / ((N_G - 1) as f64);                   // spatial grid division [m]
-const INV_DX: f64          = 1.0 / DX;                                 // inverse of spatial grid size [1/m]
-const GAS_DENSITY: f64     = PRESSURE / (K_BOLTZMANN * TEMPERATURE);   // background gas density [m-3]
+const PERIOD: f64 = 1.0 / FREQUENCY; // RF period length [s]
+const DT_E: f64 = PERIOD / (N_T as f64); // electron time step [s]
+const N_SUB: u32 = 20; // ions move only in these cycles (subcycling)
+const DT_I: f64 = (N_SUB as f64) * DT_E; // ion time step [s]
+const DX: f64 = L / ((N_G - 1) as f64); // spatial grid division [m]
+const INV_DX: f64 = 1.0 / DX; // inverse of spatial grid size [1/m]
+const GAS_DENSITY: f64 = PRESSURE / (K_BOLTZMANN * TEMPERATURE); // background gas density [m-3]
 
 // electron and ion cross sections
-const N_CS: usize          = 5;                      // total number of processes / cross sections
-const E_ELA: usize         = 0;                      // process identifier: electron/elastic
-const E_EXC: usize         = 1;                      // process identifier: electron/excitation
-const E_ION: usize         = 2;                      // process identifier: electron/ionization
-const I_ISO: usize         = 3;                      // process identifier: ion/elastic/isotropic
-const I_BACK: usize        = 4;                      // process identifier: ion/elastic/backscattering
-const E_EXC_TH: f64        = 11.5;                   // electron impact excitation threshold [eV]
-const E_ION_TH: f64        = 15.8;                   // electron impact ionization threshold [eV]
-const CS_RANGES: usize     = 1_000_000;              // number of entries in cross section arrays
-const DE_CS: f64           = 0.001;                  // energy division in cross section arrays [eV]
+const N_CS: usize = 5; // total number of processes / cross sections
+const E_ELA: usize = 0; // process identifier: electron/elastic
+const E_EXC: usize = 1; // process identifier: electron/excitation
+const E_ION: usize = 2; // process identifier: electron/ionization
+const I_ISO: usize = 3; // process identifier: ion/elastic/isotropic
+const I_BACK: usize = 4; // process identifier: ion/elastic/backscattering
+const E_EXC_TH: f64 = 11.5; // electron impact excitation threshold [eV]
+const E_ION_TH: f64 = 15.8; // electron impact ionization threshold [eV]
+const CS_RANGES: usize = 1_000_000; // number of entries in cross section arrays
+const DE_CS: f64 = 0.001; // energy division in cross section arrays [eV]
 
 // measurement conditions
-const MIN_X: f64           = 0.45 * L;               // lower limit of central region
-const MAX_X: f64           = 0.55 * L;               // upper limit of central region
-const N_EEPF: usize        = 2000;                   // number of energy bins in Electron Energy Probability Function (EEPF)
-const DE_EEPF: f64         = 0.05;                   // resolution of EEPF [eV]
+const MIN_X: f64 = 0.45 * L; // lower limit of central region
+const MAX_X: f64 = 0.55 * L; // upper limit of central region
+const N_EEPF: usize = 2000; // number of energy bins in Electron Energy Probability Function (EEPF)
+const DE_EEPF: f64 = 0.05; // resolution of EEPF [eV]
 
 // gpu capacity and allocation constants
-const MAX_PARTICLES: usize = 120_000;                       // maximum number of particles per species (pre-allocated on GPU).
-const FACTOR_E: f64 = DT_E / E_MASS * (-E_CHARGE);          // leapfrog acceleration factor for electrons
-const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE;            // leapfrog acceleration factor for ions
-const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX);  // weight factor for density deposition
+const MAX_PARTICLES: usize = 120_000; // maximum number of particles per species (pre-allocated on gpu).
+const FACTOR_E: f64 = DT_E / E_MASS * (-E_CHARGE); // leapfrog acceleration factor for electrons
+const FACTOR_I: f64 = DT_I / AR_MASS * E_CHARGE; // leapfrog acceleration factor for ions
+const WEIGHT_FACTOR: f64 = WEIGHT / (ELECTRODE_AREA * DX); // weight factor for density deposition
 
 // kernel launch parameters
-const MAX_PARTICLES_U32: u32 = MAX_PARTICLES as u32;                            // particle amount for kernel launch param
-const POISSON_SCAN_BLOCK_SIZE: u32   = 416;                                     // size of block for poisson kernel 
-const POISSON_SCAN_NUM_WARPS:  usize = POISSON_SCAN_BLOCK_SIZE as usize / 32;   // amount of warps in block for poisson kernel
-const COMPACT_BLOCK_SIZE: u32   = 512;                                          // size of block for stream compaction kernel
-const COMPACT_NUM_WARPS:  usize = COMPACT_BLOCK_SIZE as usize / 32;             // amount of warps in block for stream compaction kernel
+const MAX_PARTICLES_U32: u32 = MAX_PARTICLES as u32; // particle amount for kernel launch param
+const POISSON_SCAN_BLOCK_SIZE: u32 = 416; // size of block for poisson kernel
+const POISSON_SCAN_NUM_WARPS: usize = POISSON_SCAN_BLOCK_SIZE as usize / 32; // amount of warps in block for poisson kernel
+const COMPACT_BLOCK_SIZE: u32 = 512; // size of block for stream compaction kernel
+const COMPACT_NUM_WARPS: usize = COMPACT_BLOCK_SIZE as usize / 32; // amount of warps in block for stream compaction kernel
 
 // collisions
-const NORMAL_RANGE: Real = 269.90040554976775;                                // thermal velocity of background gas
-const F1: Real = (E_MASS / (E_MASS + AR_MASS)) as Real;                       // precomputed factor
-const F2: Real = (AR_MASS / (E_MASS + AR_MASS)) as Real;                      // precomputed factor
-const HALF_E_MASS_OVER_E_CHARGE: Real = (0.5 * E_MASS / E_CHARGE) as Real;    // precomputed factor
-const HALF_MU_ARAR_OVER_E_CHARGE: Real = (0.5 * MU_ARAR / E_CHARGE) as Real;  // precomputed factor
-const LOG2_E: Real = 1.4426950408889634;                                      // log2(e)
+const NORMAL_RANGE: Real = 269.90040554976775; // thermal velocity of background gas
+const F1: Real = (E_MASS / (E_MASS + AR_MASS)) as Real; // precomputed factor
+const F2: Real = (AR_MASS / (E_MASS + AR_MASS)) as Real; // precomputed factor
+const HALF_E_MASS_OVER_E_CHARGE: Real = (0.5 * E_MASS / E_CHARGE) as Real; // precomputed factor
+const HALF_MU_ARAR_OVER_E_CHARGE: Real = (0.5 * MU_ARAR / E_CHARGE) as Real; // precomputed factor
+const LOG2_E: Real = 1.4426950408889634; // log2(e)
 
 // poisson solver
-const E_CHARGE_F: f32 = E_CHARGE as f32;                         // f32 electron charge
-const INV_DX_F: f32 = INV_DX as f32;                             // f32 inverse of spatial grid size
-const ALPHA_F: f32 = (-DX * DX / EPSILON0) as f32;               // precomputed factor
-const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32;  // precomputed factor
-const HALF_INV_DX_F: Real = (0.5 * INV_DX) as Real;              // precomputed factor             
-        
+const E_CHARGE_F: f32 = E_CHARGE as f32; // f32 electron charge
+const INV_DX_F: f32 = INV_DX as f32; // f32 inverse of spatial grid size
+const ALPHA_F: f32 = (-DX * DX / EPSILON0) as f32; // precomputed factor
+const HALF_DX_OVER_EPS_F: f32 = (DX / (2.0 * EPSILON0)) as f32; // precomputed factor
+const HALF_INV_DX_F: Real = (0.5 * INV_DX) as Real; // precomputed factor
+
 // measurment
-const MIN_X_F: Real = MIN_X as Real;        // f32 lower limit of central region
-const MAX_X_F: Real = MAX_X as Real;        // f32 upper limit of central region
-const DE_EEPF_F: Real = DE_EEPF as Real;    // f32 resolution of EEPF
-const CHECKPOINT_CYCLES: usize = 100;       // cycles to retrieve number of particles from gpu
+const MIN_X_F: Real = MIN_X as Real; // f32 lower limit of central region
+const MAX_X_F: Real = MAX_X as Real; // f32 upper limit of central region
+const DE_EEPF_F: Real = DE_EEPF as Real; // f32 resolution of EEPF
+const CHECKPOINT_CYCLES: usize = 100; // cycles to retrieve number of particles from gpu
 
 // host side particle data container
 struct ParticlesSoA {
-    x:  Vec<Real>,
+    x: Vec<Real>,
     vx: Vec<Real>,
     vy: Vec<Real>,
     vz: Vec<Real>,
@@ -118,7 +120,7 @@ struct ParticlesSoA {
 impl ParticlesSoA {
     fn with_capacity(cap: usize) -> Self {
         Self {
-            x:  vec![0.0 as Real; cap],
+            x: vec![0.0 as Real; cap],
             vx: vec![0.0 as Real; cap],
             vy: vec![0.0 as Real; cap],
             vz: vec![0.0 as Real; cap],
@@ -129,24 +131,24 @@ impl ParticlesSoA {
 // gpu simulation state data
 struct GpuSimState {
     // electron particle arrays (pre-allocated to MAX_PARTICLES)
-    e_x:  DeviceBuffer<Real>,
+    e_x: DeviceBuffer<Real>,
     e_vx: DeviceBuffer<Real>,
     e_vy: DeviceBuffer<Real>,
     e_vz: DeviceBuffer<Real>,
 
     // ion particle arrays (pre-allocated to MAX_PARTICLES)
-    i_x:  DeviceBuffer<Real>,
+    i_x: DeviceBuffer<Real>,
     i_vx: DeviceBuffer<Real>,
     i_vy: DeviceBuffer<Real>,
     i_vz: DeviceBuffer<Real>,
 
     // particle counters
     n_electrons: DeviceBuffer<u32>,
-    n_ions:      DeviceBuffer<u32>,
+    n_ions: DeviceBuffer<u32>,
 
     // grid
-    efield:    DeviceBuffer<Real>,
-    pot:       DeviceBuffer<Real>,
+    efield: DeviceBuffer<Real>,
+    pot: DeviceBuffer<Real>,
     e_density: DeviceBuffer<Real>,
     i_density: DeviceBuffer<Real>,
 
@@ -168,7 +170,7 @@ struct GpuSimState {
     rng_i3: DeviceBuffer<u32>,
 
     // buffers for stream compaction
-    tmp_x:  DeviceBuffer<Real>,
+    tmp_x: DeviceBuffer<Real>,
     tmp_vx: DeviceBuffer<Real>,
     tmp_vy: DeviceBuffer<Real>,
     tmp_vz: DeviceBuffer<Real>,
@@ -177,29 +179,32 @@ struct GpuSimState {
     alive_counter: DeviceBuffer<u32>,
 
     // measurment
-    cumul_e_density: DeviceBuffer<f64>, 
+    cumul_e_density: DeviceBuffer<f64>,
     cumul_i_density: DeviceBuffer<f64>,
-    eepf_counts:     DeviceBuffer<u32>,
+    eepf_counts: DeviceBuffer<u32>,
 }
 
 impl GpuSimState {
-    fn allocate(stream: &cuda_core::CudaStream, measure: bool) -> Result<Self, cuda_core::DriverError> {
+    fn allocate(
+        stream: &cuda_core::CudaStream,
+        measure: bool,
+    ) -> Result<Self, cuda_core::DriverError> {
         Ok(Self {
-            e_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            e_x: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             e_vx: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             e_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             e_vz: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
 
-            i_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            i_x: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             i_vx: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             i_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             i_vz: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
 
             n_electrons: DeviceBuffer::<u32>::zeroed(stream, 1)?,
-            n_ions:      DeviceBuffer::<u32>::zeroed(stream, 1)?,
+            n_ions: DeviceBuffer::<u32>::zeroed(stream, 1)?,
 
-            efield:    DeviceBuffer::<Real>::zeroed(stream, N_G)?,
-            pot:       DeviceBuffer::<Real>::zeroed(stream, N_G)?,
+            efield: DeviceBuffer::<Real>::zeroed(stream, N_G)?,
+            pot: DeviceBuffer::<Real>::zeroed(stream, N_G)?,
             e_density: DeviceBuffer::<Real>::zeroed(stream, N_G)?,
             i_density: DeviceBuffer::<Real>::zeroed(stream, N_G)?,
 
@@ -219,7 +224,7 @@ impl GpuSimState {
 
             alive_counter: DeviceBuffer::<u32>::zeroed(stream, 1)?,
 
-            tmp_x:  DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
+            tmp_x: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             tmp_vx: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             tmp_vy: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
             tmp_vz: DeviceBuffer::<Real>::zeroed(stream, MAX_PARTICLES)?,
@@ -275,7 +280,7 @@ impl GpuSimState {
     fn upload_cross_sections(
         &mut self,
         stream: &cuda_core::CudaStream,
-        cs_flat: &[Real],       
+        cs_flat: &[Real],
         sigma_tot_e: &[Real],
         sigma_tot_i: &[Real],
     ) -> Result<(), cuda_core::DriverError> {
@@ -311,11 +316,11 @@ impl GpuSimState {
         &self,
         stream: &cuda_core::CudaStream,
     ) -> Result<(ParticlesSoA, u32), cuda_core::DriverError> {
-        let x  = self.e_x.to_host_vec(stream)?;
+        let x = self.e_x.to_host_vec(stream)?;
         let vx = self.e_vx.to_host_vec(stream)?;
         let vy = self.e_vy.to_host_vec(stream)?;
         let vz = self.e_vz.to_host_vec(stream)?;
-        let n  = self.n_electrons.to_host_vec(stream)?;
+        let n = self.n_electrons.to_host_vec(stream)?;
 
         Ok((ParticlesSoA { x, vx, vy, vz }, n[0]))
     }
@@ -324,11 +329,11 @@ impl GpuSimState {
         &self,
         stream: &cuda_core::CudaStream,
     ) -> Result<(ParticlesSoA, u32), cuda_core::DriverError> {
-        let x  = self.i_x.to_host_vec(stream)?;
+        let x = self.i_x.to_host_vec(stream)?;
         let vx = self.i_vx.to_host_vec(stream)?;
         let vy = self.i_vy.to_host_vec(stream)?;
         let vz = self.i_vz.to_host_vec(stream)?;
-        let n  = self.n_ions.to_host_vec(stream)?;
+        let n = self.n_ions.to_host_vec(stream)?;
 
         Ok((ParticlesSoA { x, vx, vy, vz }, n[0]))
     }
@@ -339,7 +344,7 @@ impl GpuSimState {
     ) -> Result<(Vec<f64>, Vec<f64>, Vec<u32>), cuda_core::DriverError> {
         let e_dens = self.cumul_e_density.to_host_vec(stream)?;
         let i_dens = self.cumul_i_density.to_host_vec(stream)?;
-        let eepf   = self.eepf_counts.to_host_vec(stream)?;
+        let eepf = self.eepf_counts.to_host_vec(stream)?;
         Ok((e_dens, i_dens, eepf))
     }
 }
@@ -349,19 +354,17 @@ mod kernels {
     use super::*;
 
     #[kernel]
-    pub fn get_density(
-        x:             &[Real],
-        density:       &[Real],
-        n_active:      &[u32],
-    ) {
+    pub fn get_density(x: &[Real], density: &[Real], n_active: &[u32]) {
         static mut LOCAL_DENSITY: SharedArray<Real, N_G> = SharedArray::UNINIT;
 
-        let tid        = thread::threadIdx_x() as usize;
-        let block_size = thread::blockDim_x()  as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let block_size = thread::blockDim_x() as usize;
 
         let mut k = tid;
         while k < N_G {
-            unsafe { LOCAL_DENSITY[k] = 0.0 as Real; }
+            unsafe {
+                LOCAL_DENSITY[k] = 0.0 as Real;
+            }
             k += block_size;
         }
         thread::sync_threads();
@@ -370,16 +373,16 @@ mod kernels {
         let i = thread::index_1d().get();
         if i < n_active[0] as usize {
             let pos = x[i] * INV_DX as Real;
-            let q   = pos as usize;
-            let rem  = pos - q as Real;
-            let c1   = (1.0 as Real - rem) * WEIGHT_FACTOR as Real;
-            let c2   = rem * WEIGHT_FACTOR as Real;
+            let q = pos as usize;
+            let rem = pos - q as Real;
+            let c1 = (1.0 as Real - rem) * WEIGHT_FACTOR as Real;
+            let c2 = rem * WEIGHT_FACTOR as Real;
 
             unsafe {
                 let p: *mut SharedArray<Real, N_G> = &raw mut LOCAL_DENSITY;
                 let local_base = (*p).as_mut_ptr() as *const BlockAtomicF32;
 
-                (*local_base.add(q    )).fetch_add(c1, AtomicOrdering::Relaxed);
+                (*local_base.add(q)).fetch_add(c1, AtomicOrdering::Relaxed);
                 (*local_base.add(q + 1)).fetch_add(c2, AtomicOrdering::Relaxed);
             };
         }
@@ -402,20 +405,19 @@ mod kernels {
         }
     }
 
-
     #[kernel]
     pub fn solve_poisson_scan_f32(
-        e_density:  &[f32],
-        i_density:  &[f32],
-        mut pot:    DisjointSlice<f32>,
+        e_density: &[f32],
+        i_density: &[f32],
+        mut pot: DisjointSlice<f32>,
         mut efield: DisjointSlice<f32>,
-        pot0:       f32,
+        pot0: f32,
     ) {
         static mut SCAN_SMEM: SharedArray<f32, POISSON_SCAN_NUM_WARPS> = SharedArray::UNINIT;
-        static mut POT_S:     SharedArray<f32, N_G>            = SharedArray::UNINIT;
-        static mut R_TOTAL_S:   SharedArray<f32, 1>              = SharedArray::UNINIT;
+        static mut POT_S: SharedArray<f32, N_G> = SharedArray::UNINIT;
+        static mut R_TOTAL_S: SharedArray<f32, 1> = SharedArray::UNINIT;
 
-        let tid   = thread::threadIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
         let block = this_thread_block();
 
         let rho_i = if tid < N_G {
@@ -427,7 +429,7 @@ mod kernels {
         let g_i: f32 = if tid == 0 || tid >= N_G {
             0.0f32
         } else {
-            let f_i   = ALPHA_F * rho_i - if tid == 1 { pot0 } else { 0.0f32 };
+            let f_i = ALPHA_F * rho_i - if tid == 1 { pot0 } else { 0.0f32 };
             (tid as f32) * f_i
         };
 
@@ -445,25 +447,27 @@ mod kernels {
         let big_r_i = block_scan::<f32, Sum, _>(&block, r_i, &raw mut SCAN_SMEM);
 
         if tid == N_G - 2 {
-            unsafe { R_TOTAL_S[0] = big_r_i; }
+            unsafe {
+                R_TOTAL_S[0] = big_r_i;
+            }
         }
 
         thread::sync_threads();
         let r_total = unsafe { R_TOTAL_S[0] };
-
 
         let pot_i: f32 = if tid == 0 {
             pot0
         } else if tid < N_G - 1 {
             (tid as f32) * (r_total - big_r_i + r_i)
         } else {
-            0.0f32 
+            0.0f32
         };
 
         if tid < N_G {
-            unsafe { POT_S[tid] = pot_i; }
+            unsafe {
+                POT_S[tid] = pot_i;
+            }
         }
-
 
         thread::sync_threads();
 
@@ -472,10 +476,10 @@ mod kernels {
             *pot_elem = pk;
 
             let e_i = if tid == 0 {
-                let pk1  = unsafe { POT_S[1] };
+                let pk1 = unsafe { POT_S[1] };
                 (pk - pk1) * INV_DX_F - rho_i * HALF_DX_OVER_EPS_F
             } else if tid == N_G - 1 {
-                let pkm1  = unsafe { POT_S[N_G - 2] };
+                let pkm1 = unsafe { POT_S[N_G - 2] };
                 (pkm1 - pk) * INV_DX_F + rho_i * HALF_DX_OVER_EPS_F
             } else {
                 let pkm1 = unsafe { POT_S[tid - 1] };
@@ -489,29 +493,32 @@ mod kernels {
         }
     }
 
-
     #[kernel]
     pub fn solve_poisson_dps_flexible(
-        source:    &[f32],              
-        mut pot:   DisjointSlice<f32>,  
-        n:         u32,
-        psi_left:  f32,                 
-        psi_right: f32,                 
-        dx:        f32,
+        source: &[f32],
+        mut pot: DisjointSlice<f32>,
+        n: u32,
+        psi_left: f32,
+        psi_right: f32,
+        dx: f32,
     ) {
         static mut SCAN_SMEM: SharedArray<f32, POISSON_SCAN_NUM_WARPS> = SharedArray::UNINIT;
         static mut R_TOTAL_S: SharedArray<f32, 1> = SharedArray::UNINIT;
 
-        let tid   = thread::threadIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
         let block = this_thread_block();
-        let nn    = n as usize;
+        let nn = n as usize;
 
         let g_i: f32 = if tid == 0 || tid >= nn {
             0.0f32
         } else {
             let mut f_i = dx * dx * source[tid];
-            if tid == 1      { f_i -= psi_left; }
-            if tid == nn - 2 { f_i -= psi_right; }
+            if tid == 1 {
+                f_i -= psi_left;
+            }
+            if tid == nn - 2 {
+                f_i -= psi_right;
+            }
             (tid as f32) * f_i
         };
 
@@ -529,7 +536,9 @@ mod kernels {
         let big_r_i = block_scan::<f32, Sum, _>(&block, r_i, &raw mut SCAN_SMEM);
 
         if tid == nn - 2 {
-            unsafe { R_TOTAL_S[0] = big_r_i; }
+            unsafe {
+                R_TOTAL_S[0] = big_r_i;
+            }
         }
 
         thread::sync_threads();
@@ -556,42 +565,42 @@ mod kernels {
 
     #[kernel]
     pub fn move_and_compact(
-        efield:   &[Real],
-        src_x:    &[Real],
-        src_vx:   &[Real],
-        src_vy:   &[Real],
-        src_vz:   &[Real],
-        mut dst_x:  DisjointSlice<Real>,
+        efield: &[Real],
+        src_x: &[Real],
+        src_vx: &[Real],
+        src_vy: &[Real],
+        src_vz: &[Real],
+        mut dst_x: DisjointSlice<Real>,
         mut dst_vx: DisjointSlice<Real>,
         mut dst_vy: DisjointSlice<Real>,
         mut dst_vz: DisjointSlice<Real>,
         alive_counter: &[u32],
-        n_active:      &[u32],
-        factor:   Real,
-        dt:       Real,
-    ) {        
+        n_active: &[u32],
+        factor: Real,
+        dt: Real,
+    ) {
         static mut WARP_SUMS: SharedArray<u32, COMPACT_NUM_WARPS> = SharedArray::UNINIT;
-        static mut BASE_S:    SharedArray<u32, 1>                 = SharedArray::UNINIT;
+        static mut BASE_S: SharedArray<u32, 1> = SharedArray::UNINIT;
 
-        let i     = thread::index_1d().get();
-        let lane  = warp::lane_id();
-        let wid   = warp::warp_id() as usize;
+        let i = thread::index_1d().get();
+        let lane = warp::lane_id();
+        let wid = warp::warp_id() as usize;
         let mut flag: bool = false;
         let (mut new_x, mut new_vx, mut vyi, mut vzi): (Real, Real, Real, Real) =
             (0.0, 0.0, 0.0, 0.0);
 
         // move
         if i < n_active[0] as usize {
-            let xi  = src_x[i];
+            let xi = src_x[i];
             let vxi = src_vx[i];
 
             let pos = xi * INV_DX as Real;
-            let p   = pos as usize;
-            let c2  = pos - p as Real;
+            let p = pos as usize;
+            let c2 = pos - p as Real;
             let e_x = (1.0 as Real - c2) * efield[p] + c2 * efield[p + 1];
 
             new_vx = vxi + factor * e_x;
-            new_x  = xi  + new_vx * dt;
+            new_x = xi + new_vx * dt;
 
             if new_x >= 0.0 as Real && new_x <= L as Real {
                 flag = true;
@@ -601,19 +610,22 @@ mod kernels {
         }
 
         // compact
-        let mask        = warp::ballot(flag);
+        let mask = warp::ballot(flag);
         let lane_offset = (mask & warp::lanemask_lt()).count_ones();
-        let warp_total  = mask.count_ones();
+        let warp_total = mask.count_ones();
 
         if lane == 0 {
-            unsafe { WARP_SUMS[wid] = warp_total; }
+            unsafe {
+                WARP_SUMS[wid] = warp_total;
+            }
         }
         thread::sync_threads();
         if wid == 0 {
-            let v: u32 = if (lane as usize) < COMPACT_NUM_WARPS 
-                            { unsafe { WARP_SUMS[lane as usize] } } 
-                         else 
-                            { 0 };
+            let v: u32 = if (lane as usize) < COMPACT_NUM_WARPS {
+                unsafe { WARP_SUMS[lane as usize] }
+            } else {
+                0
+            };
 
             let mut val = v;
             let mut offset = 1u32;
@@ -627,28 +639,37 @@ mod kernels {
             let excl = val - v;
 
             if (lane as usize) < COMPACT_NUM_WARPS {
-                unsafe { WARP_SUMS[lane as usize] = excl; } // exclusive
+                unsafe {
+                    WARP_SUMS[lane as usize] = excl;
+                } // exclusive
             }
 
-            gpu_assert!(COMPACT_NUM_WARPS <= 32, "COMPACT_NUM_WARPS must be ≤ 32 for single-warp prefix scan");
+            gpu_assert!(
+                COMPACT_NUM_WARPS <= 32,
+                "COMPACT_NUM_WARPS must be ≤ 32 for single-warp prefix scan"
+            );
             if lane as usize == COMPACT_NUM_WARPS - 1 {
                 let total_block = val; // inclusive
-                let base = 
-                    if total_block > 0 {
-                        let g = unsafe { DeviceAtomicU32::from_ptr(alive_counter.as_ptr() as *mut u32) };
-                        g.fetch_add(total_block, AtomicOrdering::Relaxed)
-                    } else { 0 };
-                unsafe { BASE_S[0] = base; }
+                let base = if total_block > 0 {
+                    let g =
+                        unsafe { DeviceAtomicU32::from_ptr(alive_counter.as_ptr() as *mut u32) };
+                    g.fetch_add(total_block, AtomicOrdering::Relaxed)
+                } else {
+                    0
+                };
+                unsafe {
+                    BASE_S[0] = base;
+                }
             }
         }
         thread::sync_threads();
 
         if flag {
             let warp_base = unsafe { WARP_SUMS[wid] };
-            let base      = unsafe { BASE_S[0] };
+            let base = unsafe { BASE_S[0] };
             let slot = base as usize + warp_base as usize + lane_offset as usize;
             unsafe {
-                *dst_x.get_unchecked_mut(slot)  = new_x;
+                *dst_x.get_unchecked_mut(slot) = new_x;
                 *dst_vx.get_unchecked_mut(slot) = new_vx;
                 *dst_vy.get_unchecked_mut(slot) = vyi;
                 *dst_vz.get_unchecked_mut(slot) = vzi;
@@ -656,8 +677,8 @@ mod kernels {
         }
     }
 
-    #[inline(always)]                                                                                                                                                                
-    fn ptx_abs(x: Real) -> Real {                                                                                                                                                    
+    #[inline(always)]
+    fn ptx_abs(x: Real) -> Real {
         let result: Real;
         unsafe {
             ptx_asm!(
@@ -669,7 +690,6 @@ mod kernels {
         }
         result
     }
-
 
     #[inline(always)]
     fn ptx_sqrt(x: Real) -> Real {
@@ -783,7 +803,11 @@ mod kernels {
         if swap {
             r = (0.5 * PI as Real) - r;
         }
-        if x < 0.0 { -r } else { r }
+        if x < 0.0 {
+            -r
+        } else {
+            r
+        }
     }
 
     // https://math.stackexchange.com/a/1105038
@@ -792,12 +816,24 @@ mod kernels {
         let ax = ptx_abs(x);
         let ay = ptx_abs(y);
 
-        let a = if ay > ax { ax * ptx_rcp(ay) } else { ay * ptx_rcp(ax) };
+        let a = if ay > ax {
+            ax * ptx_rcp(ay)
+        } else {
+            ay * ptx_rcp(ax)
+        };
         let mut r = ptx_atan_poly(a);
 
-        if ay > ax { r = (0.5 * PI as Real) - r; }
-        if x < 0.0 { r = PI as Real - r; }
-        if y < 0.0 { -r } else { r }
+        if ay > ax {
+            r = (0.5 * PI as Real) - r;
+        }
+        if x < 0.0 {
+            r = PI as Real - r;
+        }
+        if y < 0.0 {
+            -r
+        } else {
+            r
+        }
     }
 
     #[inline(always)]
@@ -825,7 +861,12 @@ mod kernels {
         (x << k) | (x >> (32 - k))
     }
 
-    fn xoshiro128p_next(mut s0: u32, mut s1: u32, mut s2: u32, mut s3: u32) -> (u32, u32, u32, u32, u32) {
+    fn xoshiro128p_next(
+        mut s0: u32,
+        mut s1: u32,
+        mut s2: u32,
+        mut s3: u32,
+    ) -> (u32, u32, u32, u32, u32) {
         let result = s0 + s3;
         let t = s1 << 9;
 
@@ -834,7 +875,7 @@ mod kernels {
         s1 ^= s2;
         s0 ^= s3;
         s2 ^= t;
-        
+
         let s3 = rotl32(s3, 11);
         (result, s0, s1, s2, s3)
     }
@@ -843,7 +884,13 @@ mod kernels {
         (f32::from_bits(0x3F80_0000u32 | (x >> 9)) - 1.0) as Real
     }
 
-    fn rng_next_f32(i: usize, rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>) -> Real {
+    fn rng_next_f32(
+        i: usize,
+        rng0: &mut DisjointSlice<u32>,
+        rng1: &mut DisjointSlice<u32>,
+        rng2: &mut DisjointSlice<u32>,
+        rng3: &mut DisjointSlice<u32>,
+    ) -> Real {
         let s0 = unsafe { *rng0.get_unchecked_mut(i) };
         let s1 = unsafe { *rng1.get_unchecked_mut(i) };
         let s2 = unsafe { *rng2.get_unchecked_mut(i) };
@@ -859,30 +906,38 @@ mod kernels {
     }
 
     fn rng_next_three_normal(
-        i: usize, 
+        i: usize,
         sigma: Real,
-        rng0: &mut DisjointSlice<u32>, 
-        rng1: &mut DisjointSlice<u32>, 
-        rng2: &mut DisjointSlice<u32>, 
-        rng3: &mut DisjointSlice<u32>
+        rng0: &mut DisjointSlice<u32>,
+        rng1: &mut DisjointSlice<u32>,
+        rng2: &mut DisjointSlice<u32>,
+        rng3: &mut DisjointSlice<u32>,
     ) -> (Real, Real, Real) {
-        
         let mut s0 = unsafe { *rng0.get_unchecked_mut(i) };
         let mut s1 = unsafe { *rng1.get_unchecked_mut(i) };
         let mut s2 = unsafe { *rng2.get_unchecked_mut(i) };
         let mut s3 = unsafe { *rng3.get_unchecked_mut(i) };
 
         let (r1, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
-        s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
+        s0 = ns0;
+        s1 = ns1;
+        s2 = ns2;
+        s3 = ns3;
 
         let (r2, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
-        s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
+        s0 = ns0;
+        s1 = ns1;
+        s2 = ns2;
+        s3 = ns3;
 
         let (r3, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
-        s0 = ns0; s1 = ns1; s2 = ns2; s3 = ns3;
+        s0 = ns0;
+        s1 = ns1;
+        s2 = ns2;
+        s3 = ns3;
 
         let (r4, ns0, ns1, ns2, ns3) = xoshiro128p_next(s0, s1, s2, s3);
-        
+
         unsafe {
             *rng0.get_unchecked_mut(i) = ns0;
             *rng1.get_unchecked_mut(i) = ns1;
@@ -901,32 +956,47 @@ mod kernels {
 
         let rad1 = ptx_sqrt(-2.0 as Real * ptx_lg2(u1) * (1.0 / LOG2_E));
         let angle1 = TWO_PI as Real * u2;
-        
+
         let z0 = rad1 * ptx_cos(angle1);
         let z1 = rad1 * ptx_sin(angle1);
 
         let rad2 = ptx_sqrt(-2.0 as Real * ptx_lg2(u3) * (1.0 / LOG2_E));
         let angle2 = TWO_PI as Real * u4;
-        
+
         let z2 = rad2 * ptx_cos(angle2);
 
         (z0 * sigma, z1 * sigma, z2 * sigma)
     }
 
     #[kernel]
-    pub fn check_collisions_e(total_cs_e: &[Real], cs: &[Real], active_e: &[u32], 
-                        mut x: DisjointSlice<Real>, mut vx: DisjointSlice<Real>, mut vy: DisjointSlice<Real>, mut vz: DisjointSlice<Real>, 
-                        mut rng0: DisjointSlice<u32>, mut rng1: DisjointSlice<u32>, mut rng2: DisjointSlice<u32>, mut rng3: DisjointSlice<u32>,
-                        mut i_x: DisjointSlice<Real>, mut i_vx: DisjointSlice<Real>, mut i_vy: DisjointSlice<Real>, mut i_vz: DisjointSlice<Real>,
-                        alive_e: &[u32], alive_i: &[u32]) {
+    pub fn check_collisions_e(
+        total_cs_e: &[Real],
+        cs: &[Real],
+        active_e: &[u32],
+        mut x: DisjointSlice<Real>,
+        mut vx: DisjointSlice<Real>,
+        mut vy: DisjointSlice<Real>,
+        mut vz: DisjointSlice<Real>,
+        mut rng0: DisjointSlice<u32>,
+        mut rng1: DisjointSlice<u32>,
+        mut rng2: DisjointSlice<u32>,
+        mut rng3: DisjointSlice<u32>,
+        mut i_x: DisjointSlice<Real>,
+        mut i_vx: DisjointSlice<Real>,
+        mut i_vy: DisjointSlice<Real>,
+        mut i_vz: DisjointSlice<Real>,
+        alive_e: &[u32],
+        alive_i: &[u32],
+    ) {
         let i = thread::index_1d().get();
         if i >= active_e[0] as usize {
             return;
-        } 
+        }
 
-        let v2 = unsafe { *vx.get_unchecked_mut(i) * *vx.get_unchecked_mut(i) 
-            + *vy.get_unchecked_mut(i) * *vy.get_unchecked_mut(i) 
-            + *vz.get_unchecked_mut(i) * *vz.get_unchecked_mut(i) 
+        let v2 = unsafe {
+            *vx.get_unchecked_mut(i) * *vx.get_unchecked_mut(i)
+                + *vy.get_unchecked_mut(i) * *vy.get_unchecked_mut(i)
+                + *vz.get_unchecked_mut(i) * *vz.get_unchecked_mut(i)
         };
         let energy: Real = HALF_E_MASS_OVER_E_CHARGE * v2;
         let c1 = (energy / (DE_CS as Real) + 0.5) as usize;
@@ -937,18 +1007,50 @@ mod kernels {
         let nu: Real = total_cs_e[energy_index] * velocity;
 
         let rand_val = rng_next_f32(i, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
-        
+
         let p_coll: Real = 1.0 - ptx_exp(-nu * DT_E as Real);
         if rand_val < p_coll {
-            collision_e(cs, &mut x, &mut vx, &mut vy, &mut vz, i, energy_index, &mut rng0, &mut rng1, &mut rng2, &mut rng3,
-                       &mut i_x, &mut i_vx, &mut i_vy, &mut i_vz, alive_e, alive_i);
+            collision_e(
+                cs,
+                &mut x,
+                &mut vx,
+                &mut vy,
+                &mut vz,
+                i,
+                energy_index,
+                &mut rng0,
+                &mut rng1,
+                &mut rng2,
+                &mut rng3,
+                &mut i_x,
+                &mut i_vx,
+                &mut i_vy,
+                &mut i_vz,
+                alive_e,
+                alive_i,
+            );
         }
-        
     }
 
-    pub fn collision_e(cs: &[Real], x: &mut DisjointSlice<Real>, vx: &mut DisjointSlice<Real>, vy: &mut DisjointSlice<Real>, vz: &mut DisjointSlice<Real>, i: usize, 
-                    energy_index: usize, rng0: &mut DisjointSlice<u32>, rng1: &mut DisjointSlice<u32>, rng2: &mut DisjointSlice<u32>, rng3: &mut DisjointSlice<u32>,
-                    i_x: &mut DisjointSlice<Real>, i_vx: &mut DisjointSlice<Real>, i_vy: &mut DisjointSlice<Real>, i_vz: &mut DisjointSlice<Real>, alive_e: &[u32], alive_i: &[u32]) {
+    pub fn collision_e(
+        cs: &[Real],
+        x: &mut DisjointSlice<Real>,
+        vx: &mut DisjointSlice<Real>,
+        vy: &mut DisjointSlice<Real>,
+        vz: &mut DisjointSlice<Real>,
+        i: usize,
+        energy_index: usize,
+        rng0: &mut DisjointSlice<u32>,
+        rng1: &mut DisjointSlice<u32>,
+        rng2: &mut DisjointSlice<u32>,
+        rng3: &mut DisjointSlice<u32>,
+        i_x: &mut DisjointSlice<Real>,
+        i_vx: &mut DisjointSlice<Real>,
+        i_vy: &mut DisjointSlice<Real>,
+        i_vz: &mut DisjointSlice<Real>,
+        alive_e: &[u32],
+        alive_i: &[u32],
+    ) {
         let mut gx: Real = unsafe { *vx.get_unchecked_mut(i) };
         let mut gy: Real = unsafe { *vy.get_unchecked_mut(i) };
         let mut gz: Real = unsafe { *vz.get_unchecked_mut(i) };
@@ -970,8 +1072,11 @@ mod kernels {
         }
 
         if gy == 0.0 as Real {
-            if gz >= 0.0 as Real { phi = 0.5 * PI as Real; }
-            else { phi = -0.5 * PI as Real; }
+            if gz > 0.0 as Real {
+                phi = 0.5 * PI as Real;
+            } else {
+                phi = -0.5 * PI as Real;
+            }
         } else {
             phi = ptx_atan2(gz, gy);
         }
@@ -988,19 +1093,27 @@ mod kernels {
         let cp: Real = ptx_cos(phi);
 
         let rnd = rng_next_f32(i, rng0, rng1, rng2, rng3);
-        if rnd < t0 / t2 {                                                      // elastic scattering
+        if rnd < t0 / t2 {
+            // elastic scattering
             chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
             eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
-        } else if rnd < t1 / t2 {                                               // excitation
+        } else if rnd < t1 / t2 {
+            // excitation
             let mut energy = 0.5 * E_MASS as Real * g * g;
             energy = ptx_abs(energy - E_EXC_TH as Real * E_CHARGE as Real);
             g = ptx_sqrt(2.0 as Real * energy / E_MASS as Real);
             chi = ptx_acos(1.0 - 2.0 * rng_next_f32(i, rng0, rng1, rng2, rng3));
             eta = TWO_PI as Real * rng_next_f32(i, rng0, rng1, rng2, rng3);
-        } else {                                                                // ionization
+        } else {
+            // ionization
             let mut energy = 0.5 * E_MASS as Real * g * g;
             energy = ptx_abs(energy - E_ION_TH as Real * E_CHARGE as Real);
-            let e_new = 10.0 as Real * ptx_tan(rng_next_f32(i, rng0, rng1, rng2, rng3) * ptx_atan(energy / E_CHARGE as Real/20.0)) * E_CHARGE as Real;
+            let e_new = 10.0 as Real
+                * ptx_tan(
+                    rng_next_f32(i, rng0, rng1, rng2, rng3)
+                        * ptx_atan(energy / E_CHARGE as Real / 20.0),
+                )
+                * E_CHARGE as Real;
             let e_orig = ptx_abs(energy - e_new);
             g = ptx_sqrt(2.0 as Real * e_orig / E_MASS as Real);
             let g_new: Real = ptx_sqrt(2.0 as Real * e_new / E_MASS as Real);
@@ -1015,7 +1128,7 @@ mod kernels {
             gx = g_new * (ct * cc - st * sc * ce);
             gy = g_new * (st * cp * cc + ct * cp * sc * ce - sp * sc * se);
             gz = g_new * (st * sp * cc + ct * sp * sc * ce + cp * sc * se);
-            
+
             let n_alive = unsafe { &*(alive_e.as_ptr() as *const DeviceAtomicU32) };
             let idx = n_alive.fetch_add(1, AtomicOrdering::Relaxed);
             unsafe {
@@ -1024,7 +1137,7 @@ mod kernels {
                 *vy.get_unchecked_mut(idx as usize) = wy + F2 * gy;
                 *vz.get_unchecked_mut(idx as usize) = wz + F2 * gz;
             }
-            
+
             let n_ions_alive = unsafe { &*(alive_i.as_ptr() as *const DeviceAtomicU32) };
             let ion_idx = n_ions_alive.fetch_add(1, AtomicOrdering::Relaxed);
             let (vxa, vya, vza) = rng_next_three_normal(i, NORMAL_RANGE, rng0, rng1, rng2, rng3);
@@ -1069,7 +1182,8 @@ mod kernels {
             return;
         }
 
-        let (vxa, vya, vza) = rng_next_three_normal(i, NORMAL_RANGE, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+        let (vxa, vya, vza) =
+            rng_next_three_normal(i, NORMAL_RANGE, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
 
         let gx = unsafe { *vx.get_unchecked_mut(i) } - vxa;
         let gy = unsafe { *vy.get_unchecked_mut(i) } - vya;
@@ -1086,9 +1200,21 @@ mod kernels {
         let rand_val = rng_next_f32(i, &mut rng0, &mut rng1, &mut rng2, &mut rng3);
         let p_coll: Real = 1.0 - ptx_exp(-nu * DT_I as Real);
         if rand_val < p_coll {
-            collision_i(cs, &mut vx, &mut vy, &mut vz, i,
-                        vxa, vya, vza, energy_index,
-                        &mut rng0, &mut rng1, &mut rng2, &mut rng3);
+            collision_i(
+                cs,
+                &mut vx,
+                &mut vy,
+                &mut vz,
+                i,
+                vxa,
+                vya,
+                vza,
+                energy_index,
+                &mut rng0,
+                &mut rng1,
+                &mut rng2,
+                &mut rng3,
+            );
         }
     }
 
@@ -1128,8 +1254,11 @@ mod kernels {
             theta = ptx_atan2(ptx_sqrt(gy * gy + gz * gz), gx);
         }
         if gy == 0.0 as Real {
-            if gz >= 0.0 as Real { phi = 0.5 * PI as Real; }
-            else { phi = -0.5 * PI as Real; }
+            if gz > 0.0 as Real {
+                phi = 0.5 * PI as Real;
+            } else {
+                phi = -0.5 * PI as Real;
+            }
         } else {
             phi = ptx_atan2(gz, gy);
         }
@@ -1163,10 +1292,7 @@ mod kernels {
     }
 
     #[kernel]
-    pub fn accumulate_density(
-        density: &[Real],
-        mut cumul: DisjointSlice<f64>,
-    ) {
+    pub fn accumulate_density(density: &[Real], mut cumul: DisjointSlice<f64>) {
         if let Some((c, idx)) = cumul.get_mut_indexed() {
             *c += density[idx.get()] as f64;
         }
@@ -1174,11 +1300,11 @@ mod kernels {
 
     #[kernel]
     pub fn accumulate_eepf(
-        x:        &[Real],
-        vx:       &[Real],
-        vy:       &[Real],
-        vz:       &[Real],
-        efield:   &[Real],
+        x: &[Real],
+        vx: &[Real],
+        vy: &[Real],
+        vz: &[Real],
+        efield: &[Real],
         active_e: &[u32],
         mut eepf: DisjointSlice<u32>,
     ) {
@@ -1193,8 +1319,8 @@ mod kernels {
         }
 
         let pos = xi * INV_DX as Real;
-        let p   = pos as usize;
-        let c2  = pos - p as Real;
+        let p = pos as usize;
+        let c2 = pos - p as Real;
         let e_x = (1.0 as Real - c2) * efield[p] + c2 * efield[p + 1];
 
         let mean_vx = vx[i] - 0.5 * e_x * (DT_E * E_CHARGE / E_MASS) as Real;
@@ -1235,12 +1361,12 @@ mod kernels {
 fn init_particles(n: usize) -> ParticlesSoA {
     let mut rng = rand::rng();
     let sigma_v = (K_BOLTZMANN * TEMPERATURE / AR_MASS).sqrt();
-    let normal  = Normal::new(0.0f64, sigma_v).unwrap();
+    let normal = Normal::new(0.0f64, sigma_v).unwrap();
 
     let mut particles = ParticlesSoA::with_capacity(MAX_PARTICLES);
 
     for i in 0..n {
-        particles.x[i]  = (rng.random::<f64>() * L) as Real;
+        particles.x[i] = (rng.random::<f64>() * L) as Real;
         particles.vx[i] = rng.sample(normal) as Real;
         particles.vy[i] = rng.sample(normal) as Real;
         particles.vz[i] = rng.sample(normal) as Real;
@@ -1255,29 +1381,43 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
     let mut sigma_tot_i = vec![0.0 as Real; CS_RANGES];
 
     let qmom = |e: f64| -> f64 {
-        1.0e-20*(
-        (6.0/(1.0+e/0.1+(e/0.6).powf(2.0)).powf(3.3)-1.1*e.powf(1.4)/
-        (1.0+(e/15.0).powf(1.2))/(1.0+(e/5.5).powf(2.5)+(e/60.0).powf(4.1)).sqrt()).abs()+0.05/(1.0+e/10.0).powf(2.0)+
-        0.01*e.powf(3.0)/(1.0+(e/12.0).powf(6.0)))
+        1.0e-20
+            * ((6.0 / (1.0 + e / 0.1 + (e / 0.6).powf(2.0)).powf(3.3)
+                - 1.1 * e.powf(1.4)
+                    / (1.0 + (e / 15.0).powf(1.2))
+                    / (1.0 + (e / 5.5).powf(2.5) + (e / 60.0).powf(4.1)).sqrt())
+            .abs()
+                + 0.05 / (1.0 + e / 10.0).powf(2.0)
+                + 0.01 * e.powf(3.0) / (1.0 + (e / 12.0).powf(6.0)))
     };
 
     let qexc = |e: f64| -> f64 {
-        if e <= E_EXC_TH{0.0} else {(0.034 * (e - 11.5).powf(1.1) * (1.0 + (e / 15.0).powf(2.8))
-        / (1.0 + (e / 23.0).powf(5.5)) + 0.023 * (e - 11.5) / (1.0 + e / 80.0).powf(1.9))*1.0e-20 }
+        if e <= E_EXC_TH {
+            0.0
+        } else {
+            (0.034 * (e - 11.5).powf(1.1) * (1.0 + (e / 15.0).powf(2.8))
+                / (1.0 + (e / 23.0).powf(5.5))
+                + 0.023 * (e - 11.5) / (1.0 + e / 80.0).powf(1.9))
+                * 1.0e-20
+        }
     };
 
     let qion = |e: f64| -> f64 {
-        if e <= E_ION_TH{0.0} else {(970.0 * (e - 15.8) / (70.0 + e).powf(2.0)
-        + 0.06 * (e - 15.8).powf(2.0) * (-e / 9.0).exp())*1.0e-20 }
+        if e <= E_ION_TH {
+            0.0
+        } else {
+            (970.0 * (e - 15.8) / (70.0 + e).powf(2.0)
+                + 0.06 * (e - 15.8).powf(2.0) * (-e / 9.0).exp())
+                * 1.0e-20
+        }
     };
 
-    let qmoi = |e_lab: f64| -> f64 {
-        1.15e-18 * e_lab.powf(-0.1) * (1.0 + 0.015 / e_lab).powf(0.6)
-    };
+    let qmoi =
+        |e_lab: f64| -> f64 { 1.15e-18 * e_lab.powf(-0.1) * (1.0 + 0.015 / e_lab).powf(0.6) };
     let qiso = |e_lab: f64| -> f64 {
         2.0e-19 * e_lab.powf(-0.5) / (1.0 + e_lab) + 3.0e-19 * e_lab / (1.0 + e_lab / 3.0).powf(2.0)
     };
-    let qchx = |e_lab: f64| -> f64 { 0.5*(qmoi(e_lab)-qiso(e_lab)) };
+    let qchx = |e_lab: f64| -> f64 { 0.5 * (qmoi(e_lab) - qiso(e_lab)) };
 
     for i in 0..CS_RANGES {
         let e = if i == 0 { DE_CS } else { (i as f64) * DE_CS };
@@ -1291,11 +1431,10 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
 
     for i in 0..CS_RANGES {
         let sum_e = cs_flat[E_ELA * CS_RANGES + i] as f64
-                  + cs_flat[E_EXC * CS_RANGES + i] as f64
-                  + cs_flat[E_ION * CS_RANGES + i] as f64;
+            + cs_flat[E_EXC * CS_RANGES + i] as f64
+            + cs_flat[E_ION * CS_RANGES + i] as f64;
 
-        let sum_i = cs_flat[I_ISO * CS_RANGES + i] as f64
-                  + cs_flat[I_BACK * CS_RANGES + i] as f64;
+        let sum_i = cs_flat[I_ISO * CS_RANGES + i] as f64 + cs_flat[I_BACK * CS_RANGES + i] as f64;
 
         sigma_tot_e[i] = (sum_e * GAS_DENSITY) as Real;
         sigma_tot_i[i] = (sum_i * GAS_DENSITY) as Real;
@@ -1305,23 +1444,28 @@ fn init_cross_sections() -> (Vec<Real>, Vec<Real>, Vec<Real>) {
 }
 
 fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
-    debug_assert!(master_seed != [0, 0, 0, 0], "state should not be everywhere 0");
+    assert!(
+        master_seed != [0, 0, 0, 0],
+        "state should not be everywhere 0"
+    );
 
     const JUMP: [u32; 4] = [0x8764000b, 0xf542d2d3, 0x6fa035c3, 0x77f2db5b];
 
-    fn rotl32(x: u32, k: u32) -> u32 { (x << k) | (x >> (32 - k)) }
+    fn rotl32(x: u32, k: u32) -> u32 {
+        (x << k) | (x >> (32 - k))
+    }
     fn next(s: &mut [u32; 4]) -> u32 {
         let result = s[0] + s[3];
 
         let t = s[1] << 9;
 
-        s[2] ^= s[0]; 
+        s[2] ^= s[0];
         s[3] ^= s[1];
-        s[1] ^= s[2]; 
+        s[1] ^= s[2];
         s[0] ^= s[3];
 
-        s[2] ^= t;    
-        
+        s[2] ^= t;
+
         s[3] = rotl32(s[3], 11);
 
         result
@@ -1351,33 +1495,38 @@ fn xoshiro128_seed_streams(master_seed: [u32; 4], n: usize) -> Vec<[u32; 4]> {
     streams
 }
 
-// host side data saving helpers 
+// host side data saving helpers
 enum ParticleSpecies {
-    Electrons = 0,
-    Ions      = 1,
+    Electrons,
+    Ions,
 }
 
 impl fmt::Display for ParticleSpecies {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ParticleSpecies::Electrons => write!(f, "electrons"),
-            ParticleSpecies::Ions      => write!(f, "ions"),
+            ParticleSpecies::Ions => write!(f, "ions"),
         }
     }
 }
 
-fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, species: ParticleSpecies, tsmp: DateTime<Tz>) {
+fn save_particle_data(
+    particles: &ParticlesSoA,
+    amount: usize,
+    step: usize,
+    species: ParticleSpecies,
+    tsmp: DateTime<Tz>,
+) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
-
     let dir_path = format!("results/{}", time_stamp);
     fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/{:04}_{}_{}.csv", dir_path, step, time_stamp, species);
 
     let mut file = File::create(&filename).expect("unable to create file");
     let mut writer = BufWriter::new(file);
-    
+
     writeln!(writer, "x,vx,vy,vz").expect("unable to write header");
-    
+
     for i in 0..amount {
         writeln!(
             writer,
@@ -1390,31 +1539,53 @@ fn save_particle_data(particles: &ParticlesSoA, amount: usize, step: usize, spec
 
 fn save_particle_growth_data(n_e: Vec<u32>, n_i: Vec<u32>, tsmp: DateTime<Tz>) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
-
     let dir_path = format!("results/{}", time_stamp);
     fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/particle_growth_{}.csv", dir_path, time_stamp);
 
     let mut file = File::create(&filename).expect("unable to create file");
-    writeln!(file, "step,n_e,n_i").expect("unable to write header");
+    let mut writer = BufWriter::new(file);
+
+    writeln!(writer, "step,n_e,n_i").expect("unable to write header");
 
     for (step, (&n_e_val, &n_i_val)) in n_e.iter().zip(n_i.iter()).enumerate() {
-        writeln!(file, "{},{},{}", step*CHECKPOINT_CYCLES, n_e_val, n_i_val).expect("unable to write particle growth data");
+        writeln!(
+            writer,
+            "{},{},{}",
+            step * CHECKPOINT_CYCLES,
+            n_e_val,
+            n_i_val
+        )
+        .expect("unable to write particle growth data");
     }
 }
 
-fn save_density_avg(cumul_e: &[f64], cumul_i: &[f64], n_steps_e: f64, n_steps_i: f64, tsmp: DateTime<Tz>) {
+fn save_density_avg(
+    cumul_e: &[f64],
+    cumul_i: &[f64],
+    n_steps_e: f64,
+    n_steps_i: f64,
+    tsmp: DateTime<Tz>,
+) {
     let time_stamp = tsmp.format("%Y-%m-%d_%H-%M-%S").to_string();
     let dir_path = format!("results/{}", time_stamp);
     fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/density_avg_{}.csv", dir_path, time_stamp);
 
     let mut file = File::create(&filename).expect("unable to create file");
-    writeln!(file, "x,n_e,n_i").expect("header");
+    let mut writer = BufWriter::new(file);
+
+    writeln!(writer, "x,n_e,n_i").expect("unable to write header");
     for k in 0..N_G {
         let x = k as f64 * DX as f64;
-        writeln!(file, "{},{},{}", x, cumul_e[k] / n_steps_e as f64, cumul_i[k] / n_steps_i as f64)
-            .expect("row");
+        writeln!(
+            writer,
+            "{},{},{}",
+            x,
+            cumul_e[k] / n_steps_e as f64,
+            cumul_i[k] / n_steps_i as f64
+        )
+        .expect("unable to write density average data");
     }
 }
 
@@ -1424,14 +1595,16 @@ fn save_eepf(eepf_raw: &[u32], tsmp: DateTime<Tz>) {
     fs::create_dir_all(&dir_path).expect("unable to create directory");
     let filename = format!("{}/eepf_{}.csv", dir_path, time_stamp);
 
+    let mut file = File::create(&filename).expect("unable to create file");
+    let mut writer = BufWriter::new(file);
+
     let h: f64 = eepf_raw.iter().map(|&c| c as f64).sum::<f64>() * DE_EEPF;
 
-    let mut file = File::create(&filename).expect("unable to create file");
-    writeln!(file, "energy_eV,eepf").expect("header");
+    writeln!(writer, "energy_eV,eepf").expect("unable to write header");
     for (i, &count) in eepf_raw.iter().enumerate() {
         let e = (0.5 + i as f64) * DE_EEPF;
         let val = count as f64 / h / e.sqrt();
-        writeln!(file, "{},{}", e, val).expect("row");
+        writeln!(writer, "{},{}", e, val).expect("unable to write eepf data");
     }
 }
 
@@ -1447,37 +1620,40 @@ fn main() {
     }
     let num_cycles: usize = args[1].parse().expect("invalid cycle count");
     let measure: bool = args.get(2).map_or(false, |arg| arg == "--measure");
-    let measurement_cycles: usize = args.get(3)
+    let measurement_cycles: usize = args
+        .get(3)
         .map(|s| s.parse().expect("invalid measurement_cycles"))
-        .unwrap_or(1);
+        .unwrap_or(0);
     let measurement_start_cycle = num_cycles.saturating_sub(measurement_cycles);
 
     if measure {
-        println!(">> cudaPIC: num_cycles = {}, measure = {}, measurement_start_cycle = {}",
-        num_cycles, measure, measurement_start_cycle);
-    }
-    else {
-        println!(">> cudaPIC: num_cycles = {}, measure = {}", num_cycles, measure);
+        println!(
+            ">> cudaPIC: num_cycles = {}, measure = {}, measurement_start_cycle = {}",
+            num_cycles, measure, measurement_start_cycle
+        );
+    } else {
+        println!(
+            ">> cudaPIC: num_cycles = {}, measure = {}",
+            num_cycles, measure
+        );
     }
 
     let start_init = Instant::now();
 
     // cuda context init
-    let ctx = CudaContext::new(0).expect("failed to create CUDA context (no GPU?)");
+    let ctx = CudaContext::new(0).expect("failed to create cuda context");
     let stream = ctx.default_stream();
-    println!(">> cudaPIC: CUDA context initialized");
+    println!(">> cudaPIC: cuda context initialized");
 
     // cpu cs precomputation
     let (cs_flat, sigma_tot_e, sigma_tot_i) = init_cross_sections();
-    println!(">> cudaPIC: cross-sections computed ({} entries per process)", CS_RANGES);
 
     // cpu particle init
     let electrons_host = init_particles(N_INIT);
-    let ions_host      = init_particles(N_INIT);
+    let ions_host = init_particles(N_INIT);
 
     // gpu state allocation
-    let mut gpu = GpuSimState::allocate(&stream, measure)
-        .expect("failed to allocate GPU memory");
+    let mut gpu = GpuSimState::allocate(&stream, measure).expect("failed to allocate gpu memory");
 
     // gpu data upload
     gpu.upload_electrons(&stream, &electrons_host, N_INIT as u32)
@@ -1487,12 +1663,18 @@ fn main() {
     gpu.upload_cross_sections(&stream, &cs_flat, &sigma_tot_e, &sigma_tot_i)
         .expect("failed to upload cross-sections");
 
-    let e_seeds = xoshiro128_seed_streams([0x1234_5678, 0x1111_2222, 0x2222_3333, 0x3333_4444], MAX_PARTICLES);
-    let i_seeds = xoshiro128_seed_streams([0x4444_5555, 0x5555_6666, 0x6666_7777, 0x7777_8888], MAX_PARTICLES);
+    let e_seeds = xoshiro128_seed_streams(
+        [0x1234_5678, 0x1111_2222, 0x2222_3333, 0x3333_4444],
+        MAX_PARTICLES,
+    );
+    let i_seeds = xoshiro128_seed_streams(
+        [0x4444_5555, 0x5555_6666, 0x6666_7777, 0x7777_8888],
+        MAX_PARTICLES,
+    );
     gpu.upload_rng_state(&stream, &e_seeds, &i_seeds)
-        .expect("failed to upload RNG state");
+        .expect("failed to upload rng state");
 
-    println!(">> cudaPIC: data uploaded to GPU");
+    println!(">> cudaPIC: data uploaded to gpu");
 
     // launch configs definition
     let cfg = LaunchConfig::for_num_elems(MAX_PARTICLES_U32);
@@ -1507,47 +1689,50 @@ fn main() {
         shared_mem_bytes: 0,
     };
     let acc_density_cfg = poisson_cfg;
-    let eepf_cfg    = cfg;         
+    let eepf_cfg = cfg;
+    let col_e_cfg = cfg;
+    let col_i_cfg = cfg;
 
     // pinned mem for particle count retrieval
     let mut h_counter_e = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
     let mut h_counter_i = PinnedHostBuffer::<u32>::zeroed(&ctx, 1).unwrap();
 
     // simulation loop
-    println!(">> cudaPIC: running {} cycles x{} steps...", num_cycles, N_T);
-    let module = kernels::load(&ctx).expect("Failed to load CUDA module");
+    println!(
+        ">> cudaPIC: running {} cycles x{} steps...",
+        num_cycles, N_T
+    );
+    let module = kernels::load(&ctx).expect("failed to load cuda module");
 
-    let mut n_e: u32 = N_INIT as u32;
-    let mut n_i: u32 = N_INIT as u32;
     let mut n_e_history: Vec<u32> = Vec::with_capacity(num_cycles / CHECKPOINT_CYCLES + 1);
     let mut n_i_history: Vec<u32> = Vec::with_capacity(num_cycles / CHECKPOINT_CYCLES + 1);
-    n_e_history.push(n_e);
-    n_i_history.push(n_i);
-
-    let cfg_e = cfg;
-    let cfg_i = cfg;
+    n_e_history.push(N_INIT as u32);
+    n_i_history.push(N_INIT as u32);
 
     if measure {
-        gpu.cumul_e_density.zero_async(&stream).expect("zero cumul_e_density");
-        gpu.cumul_i_density.zero_async(&stream).expect("zero cumul_i_density");
-        gpu.eepf_counts.zero_async(&stream).expect("zero eepf_counts");
+        gpu.cumul_e_density.zero_async(&stream).expect("failed to zero cumul_e_density");
+        gpu.cumul_i_density.zero_async(&stream).expect("failed to zero cumul_i_density");
+        gpu.eepf_counts.zero_async(&stream).expect("failed to zero eepf_counts");
     }
 
-    println!("initialization time: {:.3} s", start_init.elapsed().as_secs_f64());
+    println!(
+        "initialization time: {:.3} s",
+        start_init.elapsed().as_secs_f64()
+    );
 
     let start = Instant::now();
-    
+
     for cycle in 0..num_cycles {
         let in_measurement_window = measure && cycle >= measurement_start_cycle;
 
         for t in 0..N_T {
-            gpu.e_density.zero_async(&stream).expect("Failed to zero e_density");
+            gpu.e_density.zero_async(&stream).expect("failed to zero e_density");
             module.get_density(&stream, mac_and_density_cfg,
                 &gpu.e_x, &gpu.e_density, &gpu.n_electrons,
             ).expect("get_density (electrons) failed");
 
             if t % N_SUB == 0 {
-                gpu.i_density.zero_async(&stream).expect("Failed to zero i_density");
+                gpu.i_density.zero_async(&stream).expect("failed to zero i_density");
                 module.get_density(&stream, mac_and_density_cfg,
                     &gpu.i_x, &gpu.i_density, &gpu.n_ions,
                 ).expect("get_density (ions) failed");
@@ -1597,7 +1782,7 @@ fn main() {
                 gpu.alive_counter.copy_from_device_async(&gpu.n_electrons, &stream).expect("failed to copy n_electrons to alive_counter");
             }
 
-            module.check_collisions_e(&stream, cfg_e,
+            module.check_collisions_e(&stream, col_e_cfg,
                 &gpu.sigma_tot_e, &gpu.cs, &gpu.n_electrons,
                 &mut gpu.e_x, &mut gpu.e_vx, &mut gpu.e_vy, &mut gpu.e_vz,
                 &mut gpu.rng_e0, &mut gpu.rng_e1, &mut gpu.rng_e2, &mut gpu.rng_e3,
@@ -1607,7 +1792,7 @@ fn main() {
             gpu.n_electrons.copy_from_device_async(&gpu.alive_counter, &stream).expect("failed to copy alive_counter to n_electrons");
 
             if t % N_SUB == 0 {
-                module.check_collisions_i(&stream, cfg_i,
+                module.check_collisions_i(&stream, col_i_cfg,
                     &gpu.sigma_tot_i, &gpu.cs, &gpu.n_ions,
                     &mut gpu.i_vx, &mut gpu.i_vy, &mut gpu.i_vz,
                     &mut gpu.rng_i0, &mut gpu.rng_i1, &mut gpu.rng_i2, &mut gpu.rng_i3,
@@ -1623,40 +1808,60 @@ fn main() {
         }
 
         if (cycle + 1) % CHECKPOINT_CYCLES == 0 {
-            unsafe { gpu.n_electrons.copy_to_pinned_host_async(&stream, &mut h_counter_e) }
-                .expect("copy_to_pinned_host_async n_electrons checkpoint failed");
-            unsafe { gpu.n_ions.copy_to_pinned_host_async(&stream, &mut h_counter_i) }
-                .expect("copy_to_pinned_host_async n_ions checkpoint failed");
-            
-            stream.synchronize().unwrap();
+            unsafe {
+                gpu.n_electrons.copy_to_pinned_host_async(&stream, &mut h_counter_e);
+                gpu.n_ions.copy_to_pinned_host_async(&stream, &mut h_counter_i);
+            }
 
-            println!("   checkpoint at cycle {}: n_e={}, n_i={}, time={:.3}s", cycle + 1, 
-                h_counter_e[0], h_counter_i[0], 
-                start.elapsed().as_secs_f64());
+            stream.synchronize().expect("cuda synchronization failed");
+
+            println!(
+                "   checkpoint at cycle {}: n_e={}, n_i={}, time={:.3}s",
+                cycle + 1,
+                h_counter_e[0],
+                h_counter_i[0],
+                start.elapsed().as_secs_f64()
+            );
             n_e_history.push(h_counter_e[0]);
             n_i_history.push(h_counter_i[0]);
         }
     }
 
     // synchronization and result gathering
-    ctx.synchronize().expect("CUDA synchronization failed");
+    ctx.synchronize().expect("cuda synchronization failed");
 
-    let (_electrons_result, n_e_final) = gpu.download_electrons(&stream)
+    let (_electrons_result, n_e_final) = gpu
+        .download_electrons(&stream)
         .expect("failed to download electrons");
-    let (_ions_result, n_i_final) = gpu.download_ions(&stream)
-        .expect("failed to download ions");
+    let (_ions_result, n_i_final) = gpu.download_ions(&stream).expect("failed to download ions");
 
     let elapsed = start.elapsed().as_secs_f64();
     println!(">> cudaPIC: simulation complete in {:.3} s", elapsed);
-    println!(">> cudaPIC: final particles: {} electrons, {} ions", n_e_final, n_i_final);
+    println!(
+        ">> cudaPIC: final particles: {} electrons, {} ions",
+        n_e_final, n_i_final
+    );
 
     let tsmp = chrono::Utc::now().with_timezone(&Warsaw);
-    save_particle_data(&_electrons_result, n_e_final as usize, num_cycles, ParticleSpecies::Electrons, tsmp);
-    save_particle_data(&_ions_result, n_i_final as usize, num_cycles, ParticleSpecies::Ions, tsmp);
+    save_particle_data(
+        &_electrons_result,
+        n_e_final as usize,
+        num_cycles,
+        ParticleSpecies::Electrons,
+        tsmp,
+    );
+    save_particle_data(
+        &_ions_result,
+        n_i_final as usize,
+        num_cycles,
+        ParticleSpecies::Ions,
+        tsmp,
+    );
     save_particle_growth_data(n_e_history, n_i_history, tsmp);
 
     if measure {
-        let (cumul_e, cumul_i, eepf_raw) = gpu.download_measurements(&stream)
+        let (cumul_e, cumul_i, eepf_raw) = gpu
+            .download_measurements(&stream)
             .expect("failed to download measurements");
 
         let n_steps_e = (measurement_cycles as f64 * N_T as f64) as f64;
@@ -1665,7 +1870,10 @@ fn main() {
         save_density_avg(&cumul_e, &cumul_i, n_steps_e, n_steps_i, tsmp);
         save_eepf(&eepf_raw, tsmp);
 
-        println!(">> cudaPIC: measurement data saved (density_avg, eepf, info) for {} cycles", measurement_cycles);
+        println!(
+            ">> cudaPIC: measurement data saved (density_avg, eepf, info) for {} cycles",
+            measurement_cycles
+        );
     }
 }
 
@@ -1685,9 +1893,12 @@ fn hakim_exact_fn(x: f64) -> f64 {
 }
 
 fn test_gpu_dps_convergence_hakim() {
-    println!("\n>> TEST: DPS Convergence GPU Hakim (JE11)");
+    println!("\n### test: dps convergence gpu Hakim (JE11)");
     println!("   source: 1 - 2x^2,  psi(0)=0, psi(1)=0");
-    println!("   {:>6}  {:>12}  {:>14}  {:>10}", "N_elem", "dx", "avg_error", "order");
+    println!(
+        "   {:>6}  {:>12}  {:>14}  {:>10}",
+        "n_elem", "dx", "avg_error", "order"
+    );
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
@@ -1709,12 +1920,23 @@ fn test_gpu_dps_convergence_hakim() {
         let dx = 1.0 / n_elem as f64;
         dxs.push(dx);
 
-        let source_f32: Vec<f32> = (0..n).map(|i| hakim_source_fn(i as f64 * dx) as f32).collect();
+        let source_f32: Vec<f32> = (0..n)
+            .map(|i| hakim_source_fn(i as f64 * dx) as f32)
+            .collect();
         let source_dev = DeviceBuffer::from_host(&stream, &source_f32).unwrap();
         let mut pot_dev = DeviceBuffer::<f32>::zeroed(&stream, n).unwrap();
 
         module
-            .solve_poisson_dps_flexible(&stream, cfg, &source_dev, &mut pot_dev, n as u32, 0.0f32, 0.0f32, dx as f32)
+            .solve_poisson_dps_flexible(
+                &stream,
+                cfg,
+                &source_dev,
+                &mut pot_dev,
+                n as u32,
+                0.0f32,
+                0.0f32,
+                dx as f32,
+            )
             .unwrap();
 
         let pot_gpu = pot_dev.to_host_vec(&stream).unwrap();
@@ -1724,7 +1946,14 @@ fn test_gpu_dps_convergence_hakim() {
             writeln!(f, "x,psi_numerical,psi_exact").unwrap();
             for i in 0..n {
                 let x = i as f64 * dx;
-                writeln!(f, "{:.10e},{:.10e},{:.10e}", x, pot_gpu[i] as f64, hakim_exact_fn(x)).unwrap();
+                writeln!(
+                    f,
+                    "{:.10e},{:.10e},{:.10e}",
+                    x,
+                    pot_gpu[i] as f64,
+                    hakim_exact_fn(x)
+                )
+                .unwrap();
             }
         }
 
@@ -1744,7 +1973,10 @@ fn test_gpu_dps_convergence_hakim() {
             "---".to_string()
         };
 
-        println!("   {:>6}  {:>12.5e}  {:>14.6e}  {:>10}", n_elem, dx, avg_err, order_str);
+        println!(
+            "   {:>6}  {:>12.5e}  {:>14.6e}  {:>10}",
+            n_elem, dx, avg_err, order_str
+        );
     }
 }
 
@@ -1768,7 +2000,7 @@ fn load_c_xoshiro_result(path: &Path) -> Vec<u32> {
 }
 
 fn test_gpu_xoshiro() {
-    println!("\n>> TEST: xoshiro to ref");
+    println!("\n### test: xoshiro to ref");
     let c_res = load_c_xoshiro_result(Path::new("xorshiro128c/10000-c.txt"));
     let n = c_res.len();
 
@@ -1789,8 +2021,12 @@ fn test_gpu_xoshiro() {
     let mut results = vec![0u32; n];
 
     for i in 0..n {
-        module.xoshiro128p_test_wrapper(&stream, cfg, s0, s1, s2, s3, &mut dest).expect("failed to launch cuda kernel");
-        let dest_host = dest.to_host_vec(&stream).expect("failed to copy device buffer to host");
+        module
+            .xoshiro128p_test_wrapper(&stream, cfg, s0, s1, s2, s3, &mut dest)
+            .expect("failed to launch cuda kernel");
+        let dest_host = dest
+            .to_host_vec(&stream)
+            .expect("failed to copy device buffer to host");
         results[i] = dest_host[0];
         s0 = dest_host[1];
         s1 = dest_host[2];
@@ -1808,10 +2044,7 @@ fn test_gpu_xoshiro() {
 
     match first_mismatch {
         None => {
-            println!(
-                "   gpu xoshiro matches C reference for all {} values",
-                n
-            );
+            println!("   gpu xoshiro matches C reference for all {} values", n);
 
             let dir_path = format!("results/xoshiro128p_test");
             fs::create_dir_all(&dir_path).expect("unable to create directory");
@@ -1825,7 +2058,7 @@ fn test_gpu_xoshiro() {
             }
         }
         Some(i) => {
-            println!("gpu xoshiro diverged from reference at index {}", i);
+            println!("  gpu xoshiro diverged from reference at index {}", i);
         }
     }
 }
