@@ -122,7 +122,7 @@ runs on the GPU without per-step transfers**:
 ## Running
 
 ```
-cudaPIC <number_of_RF_cycles> [--measure] [number_of_measurement_cycles]
+cudapic <number_of_RF_cycles> [--measure] [number_of_measurement_cycles]
 ```
 
 `--measure` enables accumulation of the averaged charge density and the
